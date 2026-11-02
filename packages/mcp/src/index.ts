@@ -12,6 +12,7 @@ import type { CallToolResult } from '@modelcontextprotocol/server';
 import { serveStdio, StdioServerTransport } from '@modelcontextprotocol/server/stdio';
 
 import pkg from '../package.json' with { type: 'json' };
+import { authTokenPath, localAuthToken } from './auth-token.js';
 import { BUILD_ID } from './build-id.js';
 import {
   dispatchTargeted,
@@ -66,6 +67,13 @@ const SERVER_VERSION = pkg.version;
 const log = (msg: string): void => {
   process.stderr.write(`${msg}\n`);
 };
+
+localAuthToken();
+log(
+  process.env.FIGWRIGHT_TOKEN?.trim()
+    ? '[figwright] local auth token from FIGWRIGHT_TOKEN'
+    : `[figwright] local auth token file ${authTokenPath()}`,
+);
 
 // FIGWRIGHT_PORT is a test/debug seam (the process-lifecycle e2e spawns real servers on a random
 // port). The plugin always connects to DEFAULT_PORT, so overriding this in normal use just makes

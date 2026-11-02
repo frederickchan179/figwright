@@ -7,6 +7,7 @@ import {
 } from '@figwright/shared';
 import { decode, encode } from '@msgpack/msgpack';
 
+import { AUTH_HEADER, localAuthToken } from '../auth-token.js';
 import type { PluginSessionInfo } from '../routing/sessions.js';
 import { ABDICATE_PATH, PING_PATH, RPC_PATH } from './leader-endpoints.js';
 
@@ -78,6 +79,10 @@ export class Follower {
     return this.opts.leaderUrl;
   }
 
+  private authHeaders(extra?: Record<string, string>): Record<string, string> {
+    return { [AUTH_HEADER]: localAuthToken(), ...extra };
+  }
+
   /**
    * One GET /ping, parsed to the raw JSON body (or undefined on any transport/HTTP/parse failure).
    * Single source for every /ping-derived read below, so timeout and error semantics can't drift
@@ -86,6 +91,7 @@ export class Follower {
   private async fetchPing(): Promise<Record<string, unknown> | undefined> {
     try {
       const res = await this.opts.fetch(`${this.opts.leaderUrl}${PING_PATH}`, {
+        headers: this.authHeaders(),
         signal: AbortSignal.timeout(this.opts.pingTimeoutMs),
       });
       if (!res.ok) {
@@ -134,7 +140,7 @@ export class Follower {
     try {
       const res = await this.opts.fetch(`${this.opts.leaderUrl}${ABDICATE_PATH}`, {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: this.authHeaders({ 'content-type': 'application/json' }),
         body: JSON.stringify({ buildId }),
         signal: AbortSignal.timeout(this.opts.pingTimeoutMs),
       });
@@ -235,7 +241,7 @@ export class Follower {
     try {
       res = await this.opts.fetch(`${this.opts.leaderUrl}${RPC_PATH}`, {
         method: 'POST',
-        headers: { 'content-type': 'application/msgpack' },
+        headers: this.authHeaders({ 'content-type': 'application/msgpack' }),
         body,
         signal,
       });

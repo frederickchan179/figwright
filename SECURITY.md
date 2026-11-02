@@ -30,6 +30,8 @@ Figwright runs **entirely on your machine**; there is no Figwright cloud service
 
   If some environment's plugin host is ever refused, `FIGWRIGHT_ALLOW_ANY_ORIGIN=1` lifts the origin gate; please report it rather than leaving it set. It deliberately does not lift the host gate. What none of this defends against is another program already running as you on the same machine; see the note on a compromised machine below.
 
+  This fork adds a machine-local token on top of those checks. `~/.figwright/auth-token` (mode `0600`, or `FIGWRIGHT_TOKEN` when that is set) must be presented on `$hello` and on every leader HTTP call. The plugin build bakes in whatever token was current on the machine that ran `pnpm build`. A web page, including one whose sandboxed iframe also sends `Origin: null`, does not have the token. A process running as you can still read the file.
+
 - **What it can access.** The plugin runs in Figma's plugin sandbox and uses the official public Plugin API, the same one every Community plugin uses. It can only touch the Figma file you have open; it cannot reach your other files, your account, or your org's data, because the Plugin API doesn't expose them.
 - **What leaves your machine.** Nothing. Figwright sends no telemetry and phones home to no one. Design data flows only between the plugin, the local relay, and your MCP client.
 - **File writes.** Export tools (screenshots, PDF, video, image fills) write only to the paths your agent explicitly passes in the tool call; the server never writes anywhere it wasn't asked to.

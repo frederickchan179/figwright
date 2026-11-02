@@ -15,6 +15,8 @@ export const ErrorCode = {
   NotLeader: 'NOT_LEADER',
   SessionUnknown: 'SESSION_UNKNOWN',
   ProtocolMismatch: 'PROTOCOL_MISMATCH',
+  // The local fork's loopback secret was missing or wrong. Retrying cannot fix it.
+  Unauthorized: 'UNAUTHORIZED',
 } as const;
 export type ErrorCode = (typeof ErrorCode)[keyof typeof ErrorCode];
 

@@ -126,6 +126,27 @@ describe('RelayClient', () => {
     expect(helloReq.method).toBe('$hello');
     expect(params.clientType).toBe('plugin');
     expect(params.protocolVersion).toBe(PROTOCOL_VERSION);
+    expect(params.authToken).toBeUndefined();
+  });
+
+  it('sends the auth token on hello when one was given', async () => {
+    const { WS, sockets } = buildFakeFactory(sock => {
+      sock.fireOpen();
+      const req = decodeEnvelope(sock.sent[0]!) as RequestEnvelope;
+      sock.fireReceive(
+        createResponse({ id: req.id, sessionId: req.sessionId, result: helloResult() }),
+      );
+    });
+    const client = new RelayClient({
+      ports: [3055],
+      clientVersion: '0.0.0',
+      authToken: 'machine-token',
+      WS,
+    });
+    await client.connect();
+    const params = (decodeEnvelope(sockets[0]!.sent[0]!) as RequestEnvelope).params as HelloParams;
+    expect(params.authToken).toBe('machine-token');
+    await client.disconnect();
   });
 
   it('falls back to next port when first port refuses', async () => {
@@ -345,6 +366,37 @@ describe('RelayClient', () => {
 
     expect(sockets.length).toBe(afterConnect);
     expect(client.getState().versionNotice).toMatch(/plugin too old/i);
+    expect(client.getState().status).toBe('disconnected');
+    await client.disconnect();
+  });
+
+  it('stops retrying when the server rejects the auth token', async () => {
+    const { WS, sockets } = buildFakeFactory(sock => {
+      sock.fireOpen();
+      const req = decodeEnvelope(sock.sent[0]!) as RequestEnvelope;
+      sock.fireReceive(
+        createError({
+          id: req.id,
+          sessionId: req.sessionId,
+          code: ErrorCode.Unauthorized,
+          message: 'auth token rejected',
+        }),
+      );
+    });
+    const client = new RelayClient({
+      ports: [3055],
+      clientVersion: '0.0.0',
+      authToken: 'wrong',
+      WS,
+      reconnectInitialDelayMs: 1,
+    });
+
+    await client.connect();
+    const afterConnect = sockets.length;
+    await new Promise(resolve => setTimeout(resolve, 250));
+
+    expect(sockets.length).toBe(afterConnect);
+    expect(client.getState().versionNotice).toMatch(/auth token rejected/i);
     expect(client.getState().status).toBe('disconnected');
     await client.disconnect();
   });

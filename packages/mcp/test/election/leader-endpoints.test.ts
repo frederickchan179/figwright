@@ -20,6 +20,7 @@ import { decode, encode } from '@msgpack/msgpack';
 import { afterEach, describe, expect, it } from 'vitest';
 import { WebSocket } from 'ws';
 
+import { AUTH_HEADER, localAuthToken } from '../../src/auth-token.js';
 import {
   ABDICATE_PATH,
   attachLeaderEndpoints,
@@ -37,6 +38,11 @@ interface Bound {
   detach: () => void;
   plugins: WebSocket[];
 }
+
+const authHeaders = (extra: Record<string, string> = {}): Record<string, string> => ({
+  [AUTH_HEADER]: localAuthToken(),
+  ...extra,
+});
 
 const all: Bound[] = [];
 
@@ -77,7 +83,7 @@ const postAbdicate = async (
 ): Promise<{ status: number; body: { ok: boolean; reason?: string } }> => {
   const res = await fetch(`http://127.0.0.1:${port}${ABDICATE_PATH}`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: authHeaders({ 'content-type': 'application/json' }),
     body: typeof body === 'string' ? body : JSON.stringify(body),
   });
   return { status: res.status, body: (await res.json()) as { ok: boolean; reason?: string } };
@@ -119,6 +125,7 @@ const attachFakePlugin = async (
     clientType: 'plugin',
     clientVersion,
     protocolVersion: PROTOCOL_VERSION,
+    authToken: localAuthToken(),
   };
   ws.send(
     encodeEnvelope(
@@ -133,7 +140,7 @@ const attachFakePlugin = async (
 const callRpc = async (port: number, req: RpcRequest): Promise<RpcResponse> => {
   const res = await fetch(`http://127.0.0.1:${port}${RPC_PATH}`, {
     method: 'POST',
-    headers: { 'content-type': 'application/msgpack' },
+    headers: authHeaders({ 'content-type': 'application/msgpack' }),
     body: Buffer.from(encode(req)),
   });
   const buf = new Uint8Array(await res.arrayBuffer());
@@ -141,9 +148,15 @@ const callRpc = async (port: number, req: RpcRequest): Promise<RpcResponse> => {
 };
 
 describe('leader endpoints', () => {
-  it('GET /ping returns server info and plugin count', async () => {
+  it('GET /ping refuses a caller that does not present the local auth token', async () => {
     const b = await startLeader();
     const res = await fetch(`http://127.0.0.1:${b.port}${PING_PATH}`);
+    expect(res.status).toBe(403);
+  });
+
+  it('GET /ping returns server info and plugin count', async () => {
+    const b = await startLeader();
+    const res = await fetch(`http://127.0.0.1:${b.port}${PING_PATH}`, { headers: authHeaders() });
     expect(res.status).toBe(200);
     const body = (await res.json()) as { ok: boolean; serverVersion: string; plugins: number };
     expect(body.ok).toBe(true);
@@ -151,19 +164,19 @@ describe('leader endpoints', () => {
     expect(body.plugins).toBe(0);
 
     await attachFakePlugin(b, async () => ({ noop: true }));
-    const res2 = await fetch(`http://127.0.0.1:${b.port}${PING_PATH}`);
+    const res2 = await fetch(`http://127.0.0.1:${b.port}${PING_PATH}`, { headers: authHeaders() });
     const body2 = (await res2.json()) as { plugins: number };
     expect(body2.plugins).toBe(1);
   });
 
   it('GET /ping exposes activeSessionId for follower-side pin resolution', async () => {
     const b = await startLeader();
-    const res = await fetch(`http://127.0.0.1:${b.port}${PING_PATH}`);
+    const res = await fetch(`http://127.0.0.1:${b.port}${PING_PATH}`, { headers: authHeaders() });
     const body = (await res.json()) as { activeSessionId: string | null };
     expect(body.activeSessionId).toBeNull();
 
     await attachFakePlugin(b, async () => ({ noop: true }));
-    const res2 = await fetch(`http://127.0.0.1:${b.port}${PING_PATH}`);
+    const res2 = await fetch(`http://127.0.0.1:${b.port}${PING_PATH}`, { headers: authHeaders() });
     const body2 = (await res2.json()) as { activeSessionId: string | null };
     expect(body2.activeSessionId).toBe(b.relay.pickActiveSessionId());
     expect(typeof body2.activeSessionId).toBe('string');
@@ -307,6 +320,7 @@ describe('leader endpoints', () => {
             clientType: 'plugin',
             clientVersion: MIN_PLUGIN_VERSION,
             protocolVersion: PROTOCOL_VERSION,
+            authToken: localAuthToken(),
           } satisfies HelloParams,
         }),
       ),
@@ -454,7 +468,7 @@ describe('leader endpoints', () => {
     const b = await startLeader();
     const res = await fetch(`http://127.0.0.1:${b.port}${RPC_PATH}`, {
       method: 'POST',
-      headers: { 'content-type': 'application/msgpack' },
+      headers: authHeaders({ 'content-type': 'application/msgpack' }),
       body: Buffer.from([0xff, 0xff, 0xff]),
     });
     expect(res.status).toBe(400);
@@ -464,7 +478,7 @@ describe('leader endpoints', () => {
     const b = await startLeader();
     const res = await fetch(`http://127.0.0.1:${b.port}${RPC_PATH}`, {
       method: 'POST',
-      headers: { 'content-type': 'application/msgpack' },
+      headers: authHeaders({ 'content-type': 'application/msgpack' }),
       body: Buffer.from(encode({ requestId: 'r-x' })),
     });
     expect(res.status).toBe(400);
@@ -476,7 +490,7 @@ describe('leader endpoints', () => {
 
   it('GET on unknown path returns 404', async () => {
     const b = await startLeader();
-    const res = await fetch(`http://127.0.0.1:${b.port}/nope`);
+    const res = await fetch(`http://127.0.0.1:${b.port}/nope`, { headers: authHeaders() });
     expect(res.status).toBe(404);
   });
 
@@ -536,7 +550,7 @@ describe('leader endpoints', () => {
     const b = await startLeader();
     const res = await fetch(`http://127.0.0.1:${b.port}${RPC_PATH}`, {
       method: 'POST',
-      headers: { 'content-type': 'text/plain' },
+      headers: authHeaders({ 'content-type': 'text/plain' }),
       body: Buffer.from(encode({ requestId: 'r-ct', toolName: 'ping' })),
     });
     expect(res.status).toBe(415);
@@ -546,7 +560,7 @@ describe('leader endpoints', () => {
     const b = await startLeader();
     const res = await fetch(`http://127.0.0.1:${b.port}${ABDICATE_PATH}`, {
       method: 'POST',
-      headers: { 'content-type': 'text/plain' },
+      headers: authHeaders({ 'content-type': 'text/plain' }),
       body: JSON.stringify({ buildId: 999_999 }),
     });
     expect(res.status).toBe(415);
@@ -554,14 +568,16 @@ describe('leader endpoints', () => {
 
   it('GET /ping advertises the buildId (0 when unset)', async () => {
     const bare = await startLeader();
-    const bareBody = (await (await fetch(`http://127.0.0.1:${bare.port}${PING_PATH}`)).json()) as {
+    const bareBody = (await (
+      await fetch(`http://127.0.0.1:${bare.port}${PING_PATH}`, { headers: authHeaders() })
+    ).json()) as {
       buildId: number;
     };
     expect(bareBody.buildId).toBe(0);
 
     const stamped = await startLeader(5_000, { buildId: 1234 });
     const stampedBody = (await (
-      await fetch(`http://127.0.0.1:${stamped.port}${PING_PATH}`)
+      await fetch(`http://127.0.0.1:${stamped.port}${PING_PATH}`, { headers: authHeaders() })
     ).json()) as { buildId: number };
     expect(stampedBody.buildId).toBe(1234);
   });

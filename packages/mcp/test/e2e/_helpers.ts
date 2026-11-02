@@ -17,6 +17,7 @@ import {
 } from '@figwright/shared';
 import { WebSocket } from 'ws';
 
+import { localAuthToken } from '../../src/auth-token.js';
 import { Follower } from '../../src/election/follower.js';
 import { attachLeaderEndpoints } from '../../src/election/leader-endpoints.js';
 import { Node } from '../../src/election/node.js';
@@ -91,6 +92,7 @@ export const connectFakePlugin = async (opts: FakePluginOptions): Promise<WebSoc
               // applied is capped at the server's own version, so this is never below it.
               clientVersion: opts.clientVersion ?? MIN_PLUGIN_VERSION,
               protocolVersion: PROTOCOL_VERSION,
+              authToken: localAuthToken(),
             },
           }),
         ),

@@ -9,6 +9,7 @@ import {
 } from '@figwright/shared';
 import { decode, encode } from '@msgpack/msgpack';
 
+import { AUTH_HEADER, localAuthToken, tokensMatch } from '../auth-token.js';
 import { hasContentType, isAllowedHost, isAllowedHttpOrigin } from '../local-access.js';
 import type { Relay } from '../relay/relay.js';
 import { checkWireCall, type WireRejection } from '../tools/wire-schema.js';
@@ -124,6 +125,16 @@ export const attachLeaderEndpoints = (http: HttpServer, deps: LeaderEndpointDeps
         `[leader] refused ${req.method ?? '?'} ${req.url ?? '?'} from origin ${req.headers.origin ?? ''}`,
       );
       writeJson(res, 403, { error: 'forbidden origin' });
+      return;
+    }
+
+    // Same secret as the plugin hello. A page that got past Origin still cannot read the file,
+    // and a custom header forces a CORS preflight we do not answer.
+    const header = req.headers[AUTH_HEADER];
+    const presented = Array.isArray(header) ? header[0] : header;
+    if (!tokensMatch(presented, localAuthToken())) {
+      log(`[leader] refused ${req.method ?? '?'} ${req.url ?? '?'} — auth token`);
+      writeJson(res, 403, { error: 'forbidden' });
       return;
     }
 

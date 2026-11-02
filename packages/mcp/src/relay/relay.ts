@@ -23,6 +23,7 @@ import {
 } from '@figwright/shared';
 import { WebSocketServer, type WebSocket } from 'ws';
 
+import { authTokenPath, localAuthToken, tokensMatch } from '../auth-token.js';
 import { isAllowedHost, isAllowedWsOrigin } from '../local-access.js';
 import type { PluginSessionInfo } from '../routing/sessions.js';
 import { DEFAULT_DISCONNECT_GRACE_MS, type Session, SessionManager } from './session.js';
@@ -452,6 +453,18 @@ export class Relay {
       return null;
     }
 
+    // Origin "null" is every sandboxed iframe, not only Figma. The token is what a web page
+    // cannot know. Checked before a session exists, so a failed hello never joins routing.
+    if (!tokensMatch(parsed.data.authToken, localAuthToken())) {
+      const source = process.env.FIGWRIGHT_TOKEN?.trim() ? 'FIGWRIGHT_TOKEN' : authTokenPath();
+      const message =
+        `auth token rejected — this server only accepts the token from ${source}. ` +
+        'Rebuild the plugin from this repo (pnpm build) with that same token and re-import it in Figma.';
+      this.opts.log(`[relay] rejecting plugin — ${message}`);
+      this.sendError(socket, env, ErrorCode.Unauthorized, message);
+      return null;
+    }
+
     // Two gates, two different questions, both settled at the handshake because this relay is a
     // stateful session — the plugin connects once and is dispatched to for as long as the panel is
     // open, so there is no per-request point at which to answer them.
@@ -570,6 +583,13 @@ export class Relay {
     }
     if (env.kind === 'res') {
       const p = this.pending.get(env.id);
+      // A second socket that learned the id must not answer a call dispatched to the real plugin.
+      if (p !== undefined && p.dispatchedToSessionId !== session.id) {
+        this.opts.log(
+          `[relay] ignored response from session ${session.id} for a request dispatched elsewhere`,
+        );
+        return;
+      }
       if (p !== undefined) {
         clearTimeout(p.timer);
         this.pending.delete(env.id);
@@ -583,6 +603,12 @@ export class Relay {
     }
     if (env.kind === 'err') {
       const p = this.pending.get(env.id);
+      if (p !== undefined && p.dispatchedToSessionId !== session.id) {
+        this.opts.log(
+          `[relay] ignored error from session ${session.id} for a request dispatched elsewhere`,
+        );
+        return;
+      }
       if (p !== undefined) {
         clearTimeout(p.timer);
         this.pending.delete(env.id);

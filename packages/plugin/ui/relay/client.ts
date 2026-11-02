@@ -36,6 +36,8 @@ export interface RelayClientOptions {
   ports: readonly number[];
   clientVersion: string;
   sessionId?: string;
+  /** Machine-local secret. The built plugin bakes this in; tests pass it explicitly. */
+  authToken?: string;
   host?: string;
   WS?: WebSocketCtor;
   log?: (msg: string) => void;
@@ -77,6 +79,13 @@ const DEFAULT_HELLO_TIMEOUT_MS = 1_000;
 const DEFAULT_CONNECT_TIMEOUT_MS = 15_000;
 const DEFAULT_RECONNECT_INITIAL_DELAY_MS = 250;
 const DEFAULT_RECONNECT_MAX_DELAY_MS = 5_000;
+
+// eslint-disable-next-line no-underscore-dangle -- dunder marks a compile-time define, per convention
+declare const __FIGWRIGHT_AUTH_TOKEN__: string | undefined;
+
+/** Empty under vitest. The production build replaces the name with this machine's token. */
+const bakedAuthToken = (): string =>
+  typeof __FIGWRIGHT_AUTH_TOKEN__ === 'string' ? __FIGWRIGHT_AUTH_TOKEN__ : '';
 /**
  * Cold-start (never-yet-connected) polling is capped tighter than a true reconnect: when the plugin
  * opened before the server, the user just launched their MCP client and the leader appears within a
@@ -98,7 +107,7 @@ const COLD_START_MAX_DELAY_MS = 1_000;
 
 export class RelayClient {
   readonly sessionId: string;
-  private readonly opts: Required<Omit<RelayClientOptions, 'sessionId'>>;
+  private readonly opts: Required<Omit<RelayClientOptions, 'sessionId' | 'authToken'>>;
   private state: RelayClientState = initialRelayState();
   private socket: WebSocket | null = null;
   private heartbeat: HeartbeatMonitor | null = null;
@@ -118,10 +127,10 @@ export class RelayClient {
    */
   private hasConnected = false;
   /**
-   * True once a server has refused this build outright — which now means only one thing: a
-   * `PROTOCOL_VERSION` mismatch, an envelope format the two sides cannot exchange at all. (Being
-   * _older_ than the server is not refused; it connects and every result carries a warning.)
-   * Retrying cannot change that answer, so the back-off loop stops instead of running forever.
+   * True once a server has refused this build outright: a `PROTOCOL_VERSION` mismatch, or this
+   * fork's auth token. (Being _older_ than the server is not refused; it connects and every result
+   * carries a warning.) Retrying cannot change that answer, so the back-off loop stops instead of
+   * running forever.
    *
    * The cost of not stopping is not theoretical: a refused plugin never sets `hasConnected`, so the
    * loop takes the 150ms cold-start ceiling and re-offers the same rejected handshake about seven
@@ -130,9 +139,11 @@ export class RelayClient {
    */
   private refused = false;
   private toolHandler: ToolHandler | null = null;
+  private readonly authToken: string;
 
   constructor(opts: RelayClientOptions) {
     this.sessionId = opts.sessionId ?? newId();
+    this.authToken = opts.authToken ?? bakedAuthToken();
     this.opts = {
       ports: opts.ports,
       clientVersion: opts.clientVersion,
@@ -315,6 +326,7 @@ export class RelayClient {
           clientType: 'plugin',
           clientVersion: this.opts.clientVersion,
           protocolVersion: PROTOCOL_VERSION,
+          ...(this.authToken === '' ? {} : { authToken: this.authToken }),
         };
         const env = createRequest({
           id: newId(),
@@ -342,7 +354,12 @@ export class RelayClient {
           // A hello rejection (e.g. a protocol-version mismatch) is a concrete, actionable reason.
           // Record it so the UI surfaces "update your plugin" rather than the generic "no server
           // found", and so the reconnect path can preserve it (see connect()).
-          if (envelope.error.code === ErrorCode.ProtocolMismatch) this.refused = true;
+          if (
+            envelope.error.code === ErrorCode.ProtocolMismatch ||
+            envelope.error.code === ErrorCode.Unauthorized
+          ) {
+            this.refused = true;
+          }
           this.update({
             lastError: envelope.error.message,
             // A refusal cannot be retried away, so it is held apart from the churn of an ordinary

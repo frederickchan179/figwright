@@ -62,6 +62,9 @@ export const HelloParamsSchema = z.object({
   // String, not a literal: a version-mismatched plugin must still parse so the relay can reject it
   // with a clear ProtocolMismatch message (see relay.handleHello), not a generic schema-parse failure.
   protocolVersion: z.string(),
+  // Optional in the schema so a plugin that predates it still parses and gets a clear rejection.
+  // This fork's relay requires it to match the machine-local token (see mcp auth-token.ts).
+  authToken: z.string().optional(),
 });
 export type HelloParams = z.infer<typeof HelloParamsSchema>;
 

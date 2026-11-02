@@ -17,6 +17,7 @@ import { decode } from '@msgpack/msgpack';
 import { afterEach, describe, expect, it } from 'vitest';
 import { WebSocket } from 'ws';
 
+import { localAuthToken } from '../../src/auth-token.js';
 import { Follower } from '../../src/election/follower.js';
 import { attachLeaderEndpoints } from '../../src/election/leader-endpoints.js';
 import { Relay } from '../../src/relay/relay.js';
@@ -108,6 +109,7 @@ const attachFakePlugin = async (
           clientType: 'plugin',
           clientVersion: MIN_PLUGIN_VERSION,
           protocolVersion: PROTOCOL_VERSION,
+          authToken: localAuthToken(),
         } satisfies HelloParams,
       }),
     ),

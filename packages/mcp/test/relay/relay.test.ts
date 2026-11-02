@@ -21,6 +21,7 @@ import {
 import { afterEach, describe, expect, it } from 'vitest';
 import { WebSocket } from 'ws';
 
+import { localAuthToken } from '../../src/auth-token.js';
 import { Relay } from '../../src/relay/relay.js';
 
 interface Bound {
@@ -99,6 +100,7 @@ const helloParams = (overrides: Partial<HelloParams> = {}): HelloParams => ({
   clientType: 'plugin',
   clientVersion: MIN_PLUGIN_VERSION,
   protocolVersion: PROTOCOL_VERSION,
+  authToken: localAuthToken(),
   ...overrides,
 });
 
@@ -161,6 +163,25 @@ describe('Relay hello loop', () => {
     expect(result.serverVersion).toBe('1.0.0');
     expect(result.protocolVersion).toBe(PROTOCOL_VERSION);
     expect(result.sessionResumed).toBe(false);
+    ws.close();
+  });
+
+  it('rejects a hello that does not present the local auth token', async () => {
+    const { port } = await startRelay();
+    const ws = await connect(port);
+    ws.send(
+      encodeEnvelope(
+        createRequest({
+          id: 'h1',
+          sessionId: newId(),
+          method: SystemMethod.Hello,
+          params: helloParams({ authToken: 'nope' }),
+        }),
+      ),
+    );
+    const res = decodeEnvelope(await nextMessage(ws)) as ErrorEnvelope;
+    expect(res.kind).toBe('err');
+    expect(res.error.code).toBe(ErrorCode.Unauthorized);
     ws.close();
   });
 

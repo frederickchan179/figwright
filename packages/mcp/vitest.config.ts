@@ -6,5 +6,8 @@ export default defineConfig({
     name: 'mcp',
     include: ['test/**/*.{test,spec}.ts'],
     environment: 'node',
+    // Keeps loadAuthToken off the developer home directory. The server, the follower and the
+    // test hellos all read this same value.
+    env: { FIGWRIGHT_TOKEN: 'figwright-test-token' },
   },
 });
