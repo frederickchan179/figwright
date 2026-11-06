@@ -290,9 +290,10 @@ size) — the exact `layoutSizingHorizontal/Vertical` codegen reads, now settabl
 first:
 
 - A container (wrapper, row, card, button) should **`HUG`** so it shrinks to its content instead of
-  staying a fixed **100×100** box — this is the single most common write miss. A frame created
-  without an explicit `width`+`height` stays 100×100 with its counter axis FIXED until you set
-  `HUG`.
+  staying a fixed **100×100** box — this is the single most common write miss. A side you don't
+  give `create_frame` stays 100, its counter axis FIXED until you set `HUG`. Pass only the side the
+  source fixes (a card's `w-[360px]`) and let the other hug: with `autoLayout`, the side passed is
+  FIXED and the primary axis hugs its content.
 - A child that should stretch fills with **`FILL`** — append it into its auto-layout parent first.
 - `FIXED` keeps an explicit size (e.g. a card pinned to a column width).
 
@@ -312,6 +313,24 @@ A new `TEXT` node defaults to a **fallback font (Inter)**, not the design system
 family/style in the `create_text` call itself (`fontName`), or with `set_text_properties` on an
 existing node (the plugin loads the node's fonts on edit). In a file whose typography is driven by `STRING` variables (a `font family` / `weight` token),
 read those off `get_variable_defs` and apply the same family — don't leave headings in Inter.
+
+## Text wraps at a width, never at a resize
+
+A new `TEXT` node is auto width: one line as long as its content. Where the source text wraps, give
+it the width it wraps at in the same call:
+
+- Text that spans its auto-layout parent (a card body, a column of copy) → `layoutSizingHorizontal:
+  'FILL'`; the height follows the lines.
+- A text block with a width of its own (`w-64`, `width: 320px`, a centred line under a hero, text
+  placed outside auto layout) → `width` on `create_text` / `set_text_properties`; the text wraps at it
+  and its height follows. `width` + `height` makes a fixed box — only when the source fixes the
+  height too (`textAlignVertical` needs one).
+- **Never `resize_nodes` a text node to make it wrap**: resizing turns it into a fixed box at the
+  height you passed, and its wrapped lines overflow that box.
+
+A line clamp (`line-clamp-2`) is `textTruncation: 'ENDING'` + `maxLines` on auto-sized text — a
+`width` (or `FILL`) with no `height`. Figma shows no line count on a fixed box: a fixed box with
+`ENDING` cuts at its own bottom edge instead (`text-overflow: ellipsis` in a box of fixed height).
 
 ## Inline rich text → `set_text_range`, not a separate node per span
 
