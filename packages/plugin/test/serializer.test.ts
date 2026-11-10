@@ -1270,6 +1270,11 @@ describe('serializeFlat — style links / component properties', () => {
     expect(out.styleIds).toEqual({ fill: 'S:abc', effect: 'S:def' });
   });
 
+  it("collects a frame's grid style", () => {
+    const out = serializeFlatSync(fake({ type: 'FRAME', gridStyleId: 'S:grid,', fillStyleId: '' }));
+    expect(out.styleIds).toEqual({ grid: 'S:grid,' });
+  });
+
   it('collapses boundVariables to flat lists of variable ids', () => {
     const out = serializeFlatSync(
       fake({
@@ -1298,6 +1303,21 @@ describe('serializeFlat — style links / component properties', () => {
       Disabled: { type: 'BOOLEAN', value: false },
       Icon: { type: 'INSTANCE_SWAP', value: '123:456' },
     });
+  });
+
+  // Measured: Figma throws on reading componentProperties of an instance whose component set has
+  // errors (two variants with the same values, or variants whose properties differ), and one such
+  // instance used to fail the whole read it sat in (issue #334).
+  it('leaves out the properties of an instance whose component set has errors, and says why', () => {
+    const node = fake({ type: 'INSTANCE' });
+    Object.defineProperty(node, 'componentProperties', {
+      get: () => {
+        throw new Error('in get_componentProperties: Component set for node has existing errors');
+      },
+    });
+    const out = serializeFlatSync(node);
+    expect(out).not.toHaveProperty('componentProperties');
+    expect(out.componentSetError).toBe('Component set for node has existing errors');
   });
 
   it('serializes which property drives a sublayer, and only the fields that name one', () => {

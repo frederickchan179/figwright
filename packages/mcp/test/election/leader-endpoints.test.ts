@@ -2,6 +2,7 @@ import { createServer, type Server as HttpServer, request as httpRequest } from 
 import type { AddressInfo } from 'node:net';
 
 import {
+  createError,
   createRequest,
   createResponse,
   decodeEnvelope,
@@ -116,8 +117,16 @@ const attachFakePlugin = async (
       env.method !== SystemMethod.Ping &&
       env.method !== SystemMethod.Hello
     ) {
-      const result = await handle(env.method, env.params);
-      ws.send(encodeEnvelope(createResponse({ id: env.id, sessionId: env.sessionId, result })));
+      // A handler that throws `{ code, message }` answers with an error, as a plugin's sandbox does.
+      try {
+        const result = await handle(env.method, env.params);
+        ws.send(encodeEnvelope(createResponse({ id: env.id, sessionId: env.sessionId, result })));
+      } catch (thrown) {
+        const { code, message } = thrown as { code: ErrorCode; message: string };
+        ws.send(
+          encodeEnvelope(createError({ id: env.id, sessionId: env.sessionId, code, message })),
+        );
+      }
     }
   });
 
@@ -162,11 +171,46 @@ describe('leader endpoints', () => {
     expect(body.ok).toBe(true);
     expect(body.serverVersion).toBe('1.0.0');
     expect(body.plugins).toBe(0);
+    // Nothing refused: the field is absent, so a clean /ping is unchanged.
+    expect(body).not.toHaveProperty('refusedConnections');
 
     await attachFakePlugin(b, async () => ({ noop: true }));
     const res2 = await fetch(`http://127.0.0.1:${b.port}${PING_PATH}`, { headers: authHeaders() });
     const body2 = (await res2.json()) as { plugins: number };
     expect(body2.plugins).toBe(1);
+  });
+
+  it('GET /ping reports lifted access checks only while they are lifted', async () => {
+    const b = await startLeader();
+    const read = async () =>
+      (await (
+        await fetch(`http://127.0.0.1:${b.port}${PING_PATH}`, { headers: authHeaders() })
+      ).json()) as Record<string, unknown>;
+    expect(await read()).not.toHaveProperty('accessChecksLifted');
+    process.env.FIGWRIGHT_ALLOW_ANY_ORIGIN = '1';
+    try {
+      expect((await read()).accessChecksLifted).toBe(true);
+    } finally {
+      delete process.env.FIGWRIGHT_ALLOW_ANY_ORIGIN;
+    }
+    expect(await read()).not.toHaveProperty('accessChecksLifted');
+  });
+
+  it('GET /ping reports refused plugin connections once there are some', async () => {
+    const b = await startLeader();
+    await new Promise<void>(resolve => {
+      const ws = new WebSocket(`ws://127.0.0.1:${b.port}`, {
+        headers: { origin: 'null', 'user-agent': 'Mozilla/5.0 Chrome/157.0.0.0 Safari/537.36' },
+      });
+      ws.once('unexpected-response', () => resolve());
+      ws.once('error', () => resolve());
+    });
+    const body = (await (
+      await fetch(`http://127.0.0.1:${b.port}${PING_PATH}`, { headers: authHeaders() })
+    ).json()) as {
+      refusedConnections?: unknown;
+    };
+    expect(body.refusedConnections).toMatchObject({ host: 0, origin: 0, userAgent: 1 });
   });
 
   it('GET /ping exposes activeSessionId for follower-side pin resolution', async () => {
@@ -303,6 +347,36 @@ describe('leader endpoints', () => {
     const resp = await respPromise;
     if (resp.kind !== 'ok') throw new Error(`expected ok, got ${resp.kind}`);
     expect(resp.result).toEqual({ ok: 'flushed' });
+  });
+
+  // The relay used to fold the plugin's code into the text and /rpc read it back from the words,
+  // so a follower got INTERNAL_ERROR for a TIMEOUT the plugin had chosen. The text stays the same.
+  it.each([
+    [
+      ErrorCode.Timeout,
+      'Unable to establish connection to Figma after 10 seconds.',
+      ErrorCode.Timeout,
+    ],
+    [ErrorCode.MethodNotFound, 'no sandbox handler (method=get_node)', ErrorCode.MethodNotFound],
+    // The plugin's catch-all: still read from the words, as before — its bridge reports timing out
+    // this way.
+    [ErrorCode.Internal, 'sandbox tool timeout (method=get_node)', ErrorCode.Timeout],
+    [ErrorCode.Internal, 'node 9:9 not found', ErrorCode.Internal],
+  ])('POST /rpc passes on a plugin error answered %s: %s', async (sent, message, expected) => {
+    const b = await startLeader();
+    await attachFakePlugin(b, async () => {
+      throw { code: sent, message };
+    });
+
+    const resp = await callRpc(b.port, {
+      requestId: `r-${sent}`,
+      toolName: 'get_node',
+      args: { nodeId: '1:1' },
+    });
+
+    if (resp.kind !== 'err') throw new Error(`expected err, got ${resp.kind}`);
+    expect(resp.code).toBe(expected);
+    expect(resp.message).toBe(`${sent}: ${message}`);
   });
 
   it('POST /rpc returns TIMEOUT when plugin does not reply in time', async () => {

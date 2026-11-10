@@ -28,6 +28,7 @@ type Mode = 'NONE' | 'HEIGHT' | 'WIDTH_AND_HEIGHT' | 'TRUNCATE';
  * - MaxLines reads back only on auto-sized text with the ellipsis on; turning the ellipsis off clears
  *   it, turning it on for auto-sized text that had none sets it to 1.
  * - A vertically centred box moves when auto height re-fits it.
+ * - It keeps one truncation limit: a line count written clears a maxHeight bound.
  *
  * Its text is one 400px line at 15px a line, so auto height is 15px per line a width wraps it into,
  * up to maxLines.
@@ -38,6 +39,7 @@ const textBox = (init: {
   height?: number;
   textTruncation?: 'DISABLED' | 'ENDING';
   maxLines?: number | null;
+  maxHeight?: number | null;
   textAlignVertical?: 'TOP' | 'CENTER';
 }) => {
   let mode: Mode = init.mode === 'TRUNCATE' ? 'NONE' : init.mode;
@@ -47,6 +49,7 @@ const textBox = (init: {
   let truncation: string =
     init.mode === 'TRUNCATE' ? 'ENDING' : (init.textTruncation ?? 'DISABLED');
   let lines: number | null = init.maxLines ?? null;
+  let maxHeight: number | null = init.maxHeight ?? null;
   const fit = (): void => {
     const before = height;
     if (mode === 'WIDTH_AND_HEIGHT') [width, height] = [400, 15];
@@ -114,12 +117,41 @@ const textBox = (init: {
     set maxLines(value: number | null) {
       if (mode === 'NONE' || truncation !== 'ENDING') return;
       lines = value;
+      if (value !== null) maxHeight = null;
       fit();
+    },
+    get maxHeight() {
+      return maxHeight;
     },
   };
 };
 
 describe('set_text_properties handler', () => {
+  // Measured: a text keeps one truncation limit, so a line count clears a maxHeight bound the call
+  // never named. The clamp lands as asked; the bound it cost is named in adjusted.
+  it('sets maxLines and names the maxHeight it replaced', async () => {
+    const node = textBox({ mode: 'HEIGHT', width: 100, textTruncation: 'ENDING', maxHeight: 40 });
+    const result = (await createSetTextPropertiesHandler(fakeFigma(node))({
+      nodeId: '1:1',
+      maxLines: 3,
+    })) as TextPropertiesResult;
+    expect(node).toMatchObject({ maxLines: 3, maxHeight: null });
+    expect(result.adjusted).toBe(
+      'maxHeight 40 was cleared — a text truncates at one limit, a line count or a maxHeight, and ' +
+        'maxLines 3 replaced it',
+    );
+  });
+
+  it('reports nothing when a call leaves a maxHeight bound in place', async () => {
+    const node = textBox({ mode: 'HEIGHT', width: 100, textTruncation: 'ENDING', maxHeight: 40 });
+    const result = (await createSetTextPropertiesHandler(fakeFigma(node))({
+      nodeId: '1:1',
+      textAlignVertical: 'TOP',
+    })) as TextPropertiesResult;
+    expect(node.maxHeight).toBe(40);
+    expect(result.adjusted).toBeUndefined();
+  });
+
   it('sets truncation / maxLines / autoResize on a TEXT node', async () => {
     const node = textBox({ mode: 'NONE', width: 100, height: 40 });
     const handler = createSetTextPropertiesHandler(fakeFigma(node));
@@ -447,16 +479,41 @@ describe('set_text_properties text box size', () => {
   });
 
   it.each([
-    [{ textTruncation: 'ENDING', maxLines: 2 }, 'NONE', /maxLines needs auto-sized text/],
-    [{ height: 40, textTruncation: 'ENDING', maxLines: 2 }, 'HEIGHT', /maxLines needs auto-sized/],
-    [{ maxLines: 2 }, 'HEIGHT', /maxLines needs textTruncation ENDING/],
-    [{ textTruncation: 'DISABLED', maxLines: 2 }, 'HEIGHT', /maxLines needs textTruncation ENDING/],
+    [
+      { textTruncation: 'ENDING', maxLines: 2 },
+      'NONE',
+      { textAutoResize: 'TRUNCATE', height: 40 },
+      /maxLines 2 was not applied — a fixed box shows no line count/,
+    ],
+    [
+      { height: 40, textTruncation: 'ENDING', maxLines: 2 },
+      'HEIGHT',
+      { textAutoResize: 'TRUNCATE', height: 40 },
+      /maxLines 2 was not applied — a fixed box/,
+    ],
+    [
+      { maxLines: 2 },
+      'HEIGHT',
+      { textAutoResize: 'HEIGHT', textTruncation: 'DISABLED' },
+      /maxLines 2 was not applied — it needs textTruncation ENDING/,
+    ],
+    [
+      { textTruncation: 'DISABLED', maxLines: 2 },
+      'HEIGHT',
+      { textAutoResize: 'HEIGHT', textTruncation: 'DISABLED' },
+      /maxLines 2 was not applied — it needs textTruncation ENDING/,
+    ],
   ] as const)(
-    'refuses %o on %s text — a maxLines Figma would drop',
-    async (args, mode, message) => {
+    'applies the rest of %o on %s text and names the maxLines Figma would not show',
+    async (args, mode, box, message) => {
+      // Figma drops such a maxLines without an error, and it never shows up later (measured), so
+      // it is left out — but the call goes on as it always did, with the rest of its fields.
       const node = textBox({ mode, width: 100, height: 40 });
-      await expect(run(node, args)).rejects.toThrow(message);
-      expect(node).toMatchObject({ textTruncation: 'DISABLED', maxLines: null });
+      const result = await run(node, { ...args, fontSize: 20 });
+      expect(node).toMatchObject({ ...box, fontSize: 20, maxLines: null });
+      expect(result.adjusted).toMatch(message);
+      // Left out of the box, not written and then reported back as Figma's refusal.
+      expect(result.adjusted).not.toMatch(/did not apply what was asked/);
     },
   );
 
@@ -544,18 +601,34 @@ describe('set_text_properties text box size', () => {
     expect(node).not.toHaveProperty('fontSize');
   });
 
-  it('refuses fixing a box an instance will not resize, leaving it as it was', async () => {
-    // Only a resize fixes a box and keeps its ellipsis; ignored, the writes around it would leave
-    // the layer half changed.
+  it('fixes auto-sized text where it stands inside an instance, by the mode write alone', async () => {
+    // At its own width the box already has the height its text shows, so no resize is needed —
+    // and the mode write lands inside an instance, where the resize would be ignored (measured).
     const node = textBox({ mode: 'HEIGHT', width: 100, textTruncation: 'ENDING', maxLines: 2 });
     Object.assign(node, {
       parent: { type: 'INSTANCE', id: '9:9', name: 'Card', parent: null },
       resize: () => {},
     });
-    await expect(run(node, { textAutoResize: 'NONE' })).rejects.toThrow(
+    const result = await run(node, { textAutoResize: 'NONE' });
+    expect(node).toMatchObject({
+      textAutoResize: 'TRUNCATE',
+      textTruncation: 'ENDING',
+      width: 100,
+      height: 30,
+    });
+    expect(result).not.toHaveProperty('adjusted');
+  });
+
+  it('still refuses re-fitting a box at a new width inside an instance', async () => {
+    const node = textBox({ mode: 'HEIGHT', width: 100 });
+    Object.assign(node, {
+      parent: { type: 'INSTANCE', id: '9:9', name: 'Card', parent: null },
+      resize: () => {},
+    });
+    await expect(run(node, { textAutoResize: 'NONE', width: 200 })).rejects.toThrow(
       /needs a resize .* inside instance 9:9/,
     );
-    expect(node).toMatchObject({ textAutoResize: 'HEIGHT', maxLines: 2 });
+    expect(node).toMatchObject({ textAutoResize: 'HEIGHT', width: 100 });
   });
 
   it('lets a mode change through inside an instance when it needs no resize', async () => {

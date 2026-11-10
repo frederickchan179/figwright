@@ -460,6 +460,7 @@ export const SerializedStyleIdsSchema = z.object({
   fill: z.string().optional(),
   stroke: z.string().optional(),
   effect: z.string().optional(),
+  grid: z.string().optional(),
   text: z.string().optional(),
 });
 export type SerializedStyleIds = z.infer<typeof SerializedStyleIdsSchema>;
@@ -734,6 +735,13 @@ export interface SerializedNode {
   explicitVariableModes?: Readonly<Record<string, string>>;
   // instance variant / props + which component it instantiates
   componentProperties?: Readonly<Record<string, SerializedComponentProperty>>;
+  /**
+   * Figma's reason for withholding the component properties of a node whose component set has
+   * errors — "Component set for node has existing errors" (measured: two variants with the same
+   * property values, or variants whose properties differ). Figma throws on reading them there, so
+   * they are left out of this node alone and the rest of the read goes on. Omitted when they read.
+   */
+  componentSetError?: string;
   mainComponent?: SerializedMainComponent;
   /**
    * Which component property drives this layer — present only on a sublayer inside a COMPONENT or
@@ -873,6 +881,7 @@ export const SerializedNodeSchema = z.lazy(() =>
     boundVariables: z.record(z.string(), z.array(z.string())).optional(),
     explicitVariableModes: z.record(z.string(), z.string()).optional(),
     componentProperties: z.record(z.string(), SerializedComponentPropertySchema).optional(),
+    componentSetError: z.string().optional(),
     mainComponent: SerializedMainComponentSchema.optional(),
     componentPropertyReferences: z
       .object({

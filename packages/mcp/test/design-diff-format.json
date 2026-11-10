@@ -1,5 +1,5 @@
 {
-  "version": 9,
+  "version": 11,
   "fields": [
     "colorProfile",
     "globalVars",
@@ -51,6 +51,7 @@
     "nodes[].componentPropertyReferences.characters",
     "nodes[].componentPropertyReferences.mainComponent",
     "nodes[].componentPropertyReferences.visible",
+    "nodes[].componentSetError",
     "nodes[].constraints",
     "nodes[].constraints.horizontal",
     "nodes[].constraints.vertical",
@@ -345,6 +346,7 @@
     "nodes[].segments[].styleIds",
     "nodes[].segments[].styleIds.effect",
     "nodes[].segments[].styleIds.fill",
+    "nodes[].segments[].styleIds.grid",
     "nodes[].segments[].styleIds.stroke",
     "nodes[].segments[].styleIds.text",
     "nodes[].segments[].textCase",
@@ -429,6 +431,7 @@
     "nodes[].styleIds",
     "nodes[].styleIds.effect",
     "nodes[].styleIds.fill",
+    "nodes[].styleIds.grid",
     "nodes[].styleIds.stroke",
     "nodes[].styleIds.text",
     "nodes[].targetAspectRatio",

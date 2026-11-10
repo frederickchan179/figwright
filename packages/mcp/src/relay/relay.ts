@@ -24,8 +24,13 @@ import {
 import { WebSocketServer, type WebSocket } from 'ws';
 
 import { authTokenPath, localAuthToken, tokensMatch } from '../auth-token.js';
-import { isAllowedHost, isAllowedWsOrigin } from '../local-access.js';
+import { classifyWsUpgrade, isAllowedHost } from '../local-access.js';
 import type { PluginSessionInfo } from '../routing/sessions.js';
+import {
+  RefusedUpgradeLog,
+  type RefusedUpgrades,
+  userAgentRefusalNotice,
+} from './refused-upgrades.js';
 import { DEFAULT_DISCONNECT_GRACE_MS, type Session, SessionManager } from './session.js';
 
 export interface RelayOptions {
@@ -66,6 +71,20 @@ export const DEFAULT_PLUGIN_REQUEST_TIMEOUT_MS = 30_000;
  */
 const PLUGIN_ENDED_CODES: ReadonlySet<number> = new Set([1000, 1001]);
 
+/**
+ * A tool call the plugin answered with an error. The text is `CODE: message` as it always was, and
+ * the code is kept as a field too: folded into the text alone, a caller that needs it — the
+ * leader's `/rpc`, answering a follower — could only guess it back from the words.
+ */
+export class PluginReplyError extends Error {
+  constructor(
+    readonly code: string,
+    message: string,
+  ) {
+    super(`${code}: ${message}`);
+  }
+}
+
 export class Relay {
   readonly sessions = new SessionManager();
   private readonly wss: WebSocketServer;
@@ -75,6 +94,7 @@ export class Relay {
   private readonly closedByServer = new WeakSet<WebSocket>();
   private heartbeatDeferrals = 0;
   private lastRequestAtMs = 0;
+  private readonly refused = new RefusedUpgradeLog();
 
   constructor(opts: RelayOptions) {
     this.opts = {
@@ -90,19 +110,34 @@ export class Relay {
       // identity via $hello and then win routing via $activity, which would put a web page between
       // the agent and the real file.
       verifyClient: ({ req }, done) => {
+        const origin = req.headers.origin;
+        const userAgent = req.headers['user-agent'];
         if (!isAllowedHost(req.headers.host)) {
+          this.refused.record('host', origin, userAgent);
           this.opts.log(
             `[relay] refused WebSocket upgrade for host ${req.headers.host ?? '(none)'}`,
           );
           done(false, 403, 'Forbidden');
           return;
         }
-        const origin = req.headers.origin;
-        if (isAllowedWsOrigin(origin)) {
+        const verdict = classifyWsUpgrade(origin, userAgent);
+        if (verdict === 'admit') {
           done(true);
           return;
         }
-        this.opts.log(`[relay] refused WebSocket upgrade from origin ${origin ?? '(none)'}`);
+        this.refused.record(verdict, origin, userAgent);
+        const refused = this.refused.snapshot();
+        // Both headers are logged: a refusal of a real plugin (a Figma build whose UA we did not
+        // anticipate) is diagnosable from this line alone. Capped, since the header is untrusted.
+        // The guidance rides only on the first such refusal — repeated attempts would otherwise
+        // repeat a paragraph per line; the count and the latest stay in ping.
+        this.opts.log(
+          `[relay] refused WebSocket upgrade (${verdict}) from origin ${origin ?? '(none)'}, ` +
+            `user-agent ${JSON.stringify((userAgent ?? '(none)').slice(0, 200))}` +
+            (verdict === 'user-agent' && refused?.userAgent === 1
+              ? ` — ${userAgentRefusalNotice(refused) ?? ''}`
+              : ''),
+        );
         done(false, 403, 'Forbidden');
       },
     });
@@ -162,7 +197,18 @@ export class Relay {
           const pending = this.pending.get(id);
           if (pending !== undefined) served.sessionId = pending.dispatchedToSessionId;
           this.pending.delete(id);
-          reject(new Error(`plugin request timeout (method=${method})`));
+          // A call no plugin ever received: when plugin connections are being refused for their
+          // User-Agent, that is the likeliest reason, and a bare timeout would hide it. The prefix
+          // stays as it was — callers map the code from the word "timeout".
+          const notice =
+            pending !== undefined && !pending.dispatched
+              ? userAgentRefusalNotice(this.refused.snapshot())
+              : null;
+          reject(
+            new Error(
+              `plugin request timeout (method=${method})${notice === null ? '' : ` — ${notice}`}`,
+            ),
+          );
         }, timeoutMs);
         const entry: Pending = {
           resolve,
@@ -250,6 +296,11 @@ export class Relay {
     let n = 0;
     for (const [, p] of this.pending) if (!p.dispatched) n += 1;
     return n;
+  }
+
+  /** Upgrades refused since this relay started, by reason with the latest; null when none were. */
+  refusedUpgrades(): RefusedUpgrades | null {
+    return this.refused.snapshot();
   }
 
   /** How many heartbeat timeouts were deferred because the session was mid-request (busy ≠ dead). */
@@ -615,7 +666,7 @@ export class Relay {
         // Recorded on the error path too: a plugin that answers METHOD_NOT_FOUND for a tool it
         // predates is the most visible thing an out-of-date one does, and the least self-explaining.
         p.served.sessionId = p.dispatchedToSessionId;
-        p.reject(new Error(`${env.error.code}: ${env.error.message}`));
+        p.reject(new PluginReplyError(env.error.code, env.error.message));
       }
       return;
     }

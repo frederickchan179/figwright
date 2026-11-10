@@ -8,6 +8,12 @@ per-property fidelity catalog, and how to ground a page too big for one call.
 
 ## Reading the tree
 
+- **`componentSetError` on an instance means its variant is unknown, not that it has none.** Figma
+  withholds `componentProperties` while the instance's component set has errors (two variants with
+  the same values, or variants whose properties differ). Build it from its `mainComponent` and
+  the screenshot, and tell the user that set needs fixing in Figma — never emit it as a prop-less
+  default.
+
 - **`colorProfile: "DISPLAY_P3"` means every colour in the payload is a P3 colour.** It is the first
   key of a result from a Display P3 file, and absent otherwise. There, a hex (and any r/g/b) is P3
   channels: `#CC6633` is what CSS writes as `color(display-p3 0.8 0.4 0.2)`, and emitted as the
@@ -122,6 +128,17 @@ the obvious ones. These are ordered by how easily they're silently dropped.
   it), `NONE` = fixed box (emit both, mind clipping); inside auto-layout trust
   `layoutSizingHorizontal/Vertical` instead. Each is omitted when it's
   the no-op default, so anything present is real intent — translate it, don't drop it.
+  - **Truncated at a height, not a line count.** `textTruncation: 'ENDING'` with no `maxLines`
+    clamps at a height — a fixed box's own (`textAutoResize: 'TRUNCATE'`: its `height`), or an
+    auto-height text's `maxHeight`. Figma shows each whole line whose box, rounded down to whole
+    pixels, ends at most 1px past that height, and puts the ellipsis on the last one. So N = the
+    largest k with ⌊k × lineHeight⌋ ≤ height + 1 (measured: Inter / Roboto / Georgia, 12–24px,
+    6,116 heights, whole and fractional, fixed boxes and `maxHeight`, no miss), where lineHeight is
+    the line box — px as given, a percentage rounded to whole px, absent (`AUTO`) the font's own
+    (about 1.2 × fontSize; 1.13–1.25 measured, so a height right at a boundary can come out one line
+    off). Emit `line-clamp-N` — never `truncate`, which puts the text on one line — with the fixed
+    box's height, or the `maxHeight` (while clamped, Figma's box stays that tall where the CSS one
+    ends at N lines).
   - **`textWrapStyle` is per paragraph, not per node.** When a node's paragraphs disagree the
     node-level field is absent and the real values ride in `segments` (a run carries it only when it
     is not `auto`) — so a `segments` array whose runs differ only in `textWrapStyle` is one text

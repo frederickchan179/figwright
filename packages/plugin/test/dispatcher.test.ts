@@ -2,7 +2,11 @@ import { ErrorCode } from '@figwright/shared';
 import { describe, expect, it, vi } from 'vitest';
 
 import { createToolCall, isPluginBridgeMessage } from '../protocol/bridge.js';
-import { dispatchSandboxMessage, type SandboxHandlers } from '../src/dispatcher.js';
+import {
+  dispatchSandboxMessage,
+  markWriteHandler,
+  type SandboxHandlers,
+} from '../src/dispatcher.js';
 
 describe('dispatchSandboxMessage', () => {
   it('replies with tool-result when handler resolves', async () => {
@@ -42,6 +46,21 @@ describe('dispatchSandboxMessage', () => {
     });
     expect(log).toHaveBeenCalled();
   });
+
+  it.each(['__proto__', 'constructor', 'toString', 'valueOf', 'hasOwnProperty'])(
+    'replies METHOD_NOT_FOUND for the inherited property name %s, never running it',
+    async method => {
+      // The handler table is a plain object, so indexing it by a name it does not own reaches
+      // Object.prototype: `constructor` would run `Object(params)` and answer ok.
+      const handlers: SandboxHandlers = { ping: () => ({ pong: true }) };
+      const raw = createToolCall({ id: 'p', method });
+      const outcome = await dispatchSandboxMessage({ raw, handlers, editorType: 'figma' });
+      expect(outcome).toMatchObject({
+        kind: 'reply',
+        reply: { kind: 'tool-error', code: ErrorCode.MethodNotFound },
+      });
+    },
+  );
 
   it('replies INTERNAL_ERROR when handler throws', async () => {
     const handlers: SandboxHandlers = {
@@ -84,6 +103,50 @@ describe('dispatchSandboxMessage', () => {
     expect((outcome as { reply: { message: string } }).reply.message).toContain('editor: dev');
   });
 
+  // Dev Mode refuses every write, so a write refused for its own arguments first still names it;
+  // a read that fails for its own reasons does not.
+  it('names Dev Mode on any error from a handler marked as a write, and not from a read', async () => {
+    const fail = (): never => {
+      throw new Error('node 9:999 not found');
+    };
+    const handlers: SandboxHandlers = { write: markWriteHandler(fail), read: () => fail() };
+    const reply = async (method: string) =>
+      (
+        (await dispatchSandboxMessage({
+          raw: createToolCall({ id: method, method }),
+          handlers,
+          editorType: 'dev',
+        })) as { reply: { message: string } }
+      ).reply.message;
+
+    expect(await reply('write')).toContain('(editor: dev — ');
+    expect(await reply('read')).toBe('node 9:999 not found');
+  });
+
+  // Measured: Figma's own "check your internet connection" came and went with the network fine,
+  // on calls it answers from its server — a lookup of a deleted id among them.
+  it.each([
+    'Unable to establish connection to Figma after 10 seconds. Please check your internet connection.',
+    'batch: op 1 (set_fills) failed, rolled back 0/1 op(s); 1 undo(s) FAILED [op 0 (group_nodes): Unable to establish connection to Figma after 10 seconds. Please check your internet connection.]',
+  ])('says what Figma\u2019s server timeout means, keeping its own words: %s', async raised => {
+    const handlers: SandboxHandlers = {
+      lookup: () => {
+        throw new Error(raised);
+      },
+    };
+    const outcome = (await dispatchSandboxMessage({
+      raw: createToolCall({ id: 's', method: 'lookup' }),
+      handlers,
+      editorType: 'figma',
+    })) as { reply: { code: string; message: string } };
+
+    // A timeout — Figma's own 10 s ran out — not a fault in the plugin.
+    expect(outcome.reply.code).toBe(ErrorCode.Timeout);
+    expect(outcome.reply.message.startsWith(raised)).toBe(true);
+    expect(outcome.reply.message).toContain("(Figma's server did not answer. Despite the wording");
+    expect(outcome.reply.message.match(/Figma's server did not answer/g)).toHaveLength(1);
+  });
+
   // Figma Design is the common case, and it must stay free of the caveat entirely.
   it('adds nothing to an error raised in Figma Design', async () => {
     const handlers: SandboxHandlers = {
@@ -96,6 +159,7 @@ describe('dispatchSandboxMessage', () => {
     const outcome = await dispatchSandboxMessage({ raw, handlers, editorType: 'figma' });
 
     expect((outcome as { reply: { message: string } }).reply.message).toBe('handler exploded');
+    expect((outcome as { reply: { code: string } }).reply.code).toBe(ErrorCode.Internal);
   });
 
   it('ignores non-bridge raw messages', async () => {

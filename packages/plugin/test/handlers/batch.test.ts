@@ -376,6 +376,28 @@ describe('batch handler', () => {
     expect(store.get('1:1')).toMatchObject({ name: 'A' }); // untouched
   });
 
+  it.each(['__proto__', 'constructor', 'toString', 'hasOwnProperty'])(
+    'rejects the inherited property name %s as an op tool at validate time, mutating nothing',
+    async tool => {
+      // The op table is a plain object: indexed by a name it does not own, it reaches
+      // Object.prototype, which is neither undefined nor an inverse.
+      const { figmaCtx, store } = makeFigma({ '1:1': { id: '1:1', name: 'A' } });
+      const handler = createBatchHandler(figmaCtx, realWrites(figmaCtx));
+
+      await expect(
+        handler({
+          ops: [
+            { tool: 'rename_node', params: { nodeId: '1:1', name: 'renamed' } },
+            { tool, params: {} },
+          ],
+        }),
+      ).rejects.toThrow(
+        `batch: op '${tool}' (index 1) is not batchable — only write tools can be batched`,
+      );
+      expect(store.get('1:1')).toMatchObject({ name: 'A' }); // first op never applied
+    },
+  );
+
   it('rejects create_component with fromNodeId (no faithful inverse) at validate time', async () => {
     const { figmaCtx, store } = makeFigma({ '1:1': { id: '1:1', type: 'FRAME', name: 'A' } });
     const handler = createBatchHandler(figmaCtx, realWrites(figmaCtx));
@@ -734,15 +756,32 @@ describe('batch handler', () => {
     expect(text).toMatchObject({ layoutSizingHorizontal: 'FILL', layoutAlign: 'STRETCH' });
   });
 
-  it('refuses a box change it could not roll back inside an instance, before running anything', async () => {
-    // Auto height needs no resize, but fixing the box again on rollback does — and the instance
-    // ignores resize() (measured), so the undo would leave the label in auto height.
+  it('runs a box change inside an instance, and says what its rollback could not resize back', async () => {
+    // Auto height needs no resize, but fixing the box again at its old height does — and the
+    // instance ignores resize() (measured). The op still runs, as it does outside a batch; the
+    // rollback puts the mode back and names the size it could not.
     const text = fakeText('I9:9;1:1', 'Hello World');
+    let mode = 'NONE';
     Object.assign(text, {
-      parent: { type: 'INSTANCE', id: '9:9', name: 'Card', parent: null },
-      textAutoResize: 'NONE',
+      parent: {
+        type: 'INSTANCE',
+        id: '9:9',
+        name: 'Card',
+        parent: null,
+        removed: false,
+        overrides: [],
+        componentProperties: {},
+        findAllWithCriteria: () => [],
+      },
       resize: () => {},
       resizeWithoutConstraints: () => {},
+    });
+    Object.defineProperty(text, 'textAutoResize', {
+      get: () => mode,
+      set: (value: string) => {
+        mode = value;
+        if (value === 'HEIGHT') text.height = 40; // re-fitted to its text
+      },
     });
     const { figmaCtx, store } = makeFigma({ F: { id: 'F', fills: [] } });
     store.set('I9:9;1:1', text);
@@ -752,12 +791,13 @@ describe('batch handler', () => {
       handler({
         ops: [
           { tool: 'set_text_properties', params: { nodeId: 'I9:9;1:1', textAutoResize: 'HEIGHT' } },
+          FAIL,
         ],
       }),
     ).rejects.toThrow(
-      /inside an instance that will not resize it, so this box change could not be rolled back/,
+      /rolled back 1 applied op\(s\) \(restored with residue: op 0 \(set_text_properties\): text I9:9;1:1 is back at 100 × 40, not the 100 × 20 it had/,
     );
-    expect(text.textAutoResize).toBe('NONE');
+    expect(mode).toBe('NONE');
   });
 
   it('brings back the runs a set_text restyled', async () => {
@@ -1956,6 +1996,47 @@ describe('batch inverses for tree structure', () => {
     expect(k2.componentPropertyDefinitions).toEqual({}); // the copy it was handed is gone
     expect([...store.keys()].filter(k => k.startsWith('S:'))).toEqual([]);
   });
+
+  // Measured in Figma Design and FigJam: in a file in a background tab, looking up the id of a node
+  // that is gone — the container a rollback just emptied, which Figma deletes itself — can hang
+  // for 10 s and throw instead of answering null, and that failed the whole rollback.
+  it.each(['group_nodes', 'repeat_nodes', 'combine_as_variants'] as const)(
+    'rolls back %s without looking up the container it deleted',
+    async tool => {
+      const { node, store, figmaCtx } = makeTree();
+      const lookup = figmaCtx.getNodeByIdAsync;
+      Object.assign(figmaCtx, {
+        getNodeByIdAsync: async (id: string) => {
+          if (!store.has(id)) {
+            throw new Error('Unable to establish connection to Figma after 10 seconds.');
+          }
+          return lookup(id);
+        },
+      });
+      const page = node('P0', 'PAGE', null);
+      const p = node('P', 'FRAME', page);
+      const kind = tool === 'combine_as_variants' ? 'COMPONENT' : 'RECTANGLE';
+      node('a', kind, p, { componentPropertyDefinitions: {} });
+      node('b', kind, p, { componentPropertyDefinitions: {} });
+      node('F', 'RECTANGLE', page, { fills: [] });
+      const handler = createBatchHandler(figmaCtx, {
+        group_nodes: createGroupNodesHandler(figmaCtx),
+        repeat_nodes: createRepeatNodesHandler(figmaCtx),
+        combine_as_variants: createCombineAsVariantsHandler(figmaCtx),
+        set_fills: createSetFillsHandler(figmaCtx),
+      });
+      const params =
+        tool === 'repeat_nodes'
+          ? { nodeIds: ['a'], modifiers: [{ repeatType: 'RADIAL', count: 8, offset: 50 }] }
+          : { nodeIds: ['a', 'b'] };
+
+      await expect(handler({ ops: [{ tool, params }, FAIL] })).rejects.toThrow(
+        /rolled back 1 applied op\(s\): /,
+      );
+      expect(ids(p)).toEqual(['a', 'b']);
+      expect([...store.keys()].filter(k => /^[GRS]:/.test(k))).toEqual([]);
+    },
+  );
 
   it('turns auto-layout back off last, after the fields only a layout mode can take', async () => {
     const { node, figmaCtx } = makeTree();
