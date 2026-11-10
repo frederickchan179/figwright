@@ -16,6 +16,18 @@ export const AUTH_HEADER = 'x-figwright-token';
 
 export const authTokenPath = (): string => join(homedir(), '.figwright', 'auth-token');
 
+/**
+ * The leader's 403 body names this reason, so a follower can tell a token mismatch from a dead
+ * leader.
+ */
+export const AUTH_REFUSED_REASON = 'auth-token';
+
+export const authMismatchMessage = (port: number): string =>
+  `port ${port} is held by a Figwright server that refused this server's auth token, so this ` +
+  `server can't reach your plugin through it. Every server on this machine must use the same ` +
+  `token: set FIGWRIGHT_TOKEN on all of them or none, and restart any server started before ` +
+  `${authTokenPath()} last changed.`;
+
 const tighten = (path: string, mode: number): void => {
   try {
     chmodSync(path, mode);

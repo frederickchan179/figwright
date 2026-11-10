@@ -4,6 +4,7 @@ import type { AddressInfo } from 'node:net';
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
+import { AUTH_HEADER } from '../../src/auth-token.js';
 import { Election, WEDGED_UNRESPONSIVE_TICKS } from '../../src/election/election.js';
 import { Follower } from '../../src/election/follower.js';
 import { attachLeaderEndpoints } from '../../src/election/leader-endpoints.js';
@@ -432,6 +433,66 @@ describe('Election: a leader that holds the port but stops answering', () => {
     await election.determineRole();
     expect(node.role).toBe(NodeRole.Conflicted);
     expect(node.conflictMessage).toContain(`pid ${process.pid}`);
+  });
+});
+
+describe("Election: a leader that refuses this server's auth token", () => {
+  const buildMismatchedElection = (
+    port: number,
+    probe: ProcessProbe,
+  ): { node: Node; election: Election; mismatch: { on: boolean } } => {
+    const mismatch = { on: true };
+    const node = new Node({ serverVersion: 'challenger-1.0.0', port });
+    extraNodes.push(node);
+    const follower = new Follower({
+      leaderUrl: `http://127.0.0.1:${port}`,
+      pingTimeoutMs: 200,
+      fetch: async (url, init) => {
+        const headers = new Headers(init?.headers);
+        if (mismatch.on) headers.set(AUTH_HEADER, 'some-other-token');
+        return globalThis.fetch(url, { ...init, headers });
+      },
+    });
+    const election = new Election({ node, follower, tickIntervalMs: 1_000_000, probe });
+    extraElections.push(election);
+    return { node, election, mismatch };
+  };
+
+  const neverProbed: ProcessProbe = {
+    inspect: () => {
+      throw new Error('a leader that answered must not be probed as wedged');
+    },
+    resume: () => {
+      throw new Error('a leader that answered must not be signalled');
+    },
+  };
+
+  it('names the token mismatch at startup instead of a wedged pid', async () => {
+    const port = await freePort();
+    await startLeaderHarness(port);
+    const { node, election } = buildMismatchedElection(port, neverProbed);
+    await election.determineRole();
+    expect(node.role).toBe(NodeRole.Conflicted);
+    expect(node.conflictMessage).toContain('auth token');
+    expect(node.conflictMessage).not.toContain('kill');
+  });
+
+  it('declares the mismatch on the first refused tick, and follows again once it is fixed', async () => {
+    const port = await freePort();
+    await startLeaderHarness(port);
+    const { node, election, mismatch } = buildMismatchedElection(port, neverProbed);
+    mismatch.on = false;
+    await election.determineRole();
+    expect(node.role).toBe(NodeRole.Follower);
+
+    mismatch.on = true;
+    await election.tickOnce();
+    expect(node.role).toBe(NodeRole.Conflicted);
+    expect(node.conflictMessage).toContain('auth token');
+
+    mismatch.on = false;
+    await election.tickOnce();
+    expect(node.role).toBe(NodeRole.Follower);
   });
 });
 

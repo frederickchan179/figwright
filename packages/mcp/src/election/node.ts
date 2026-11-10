@@ -144,8 +144,11 @@ export class Node {
    * before the idempotent early return — a first, anonymous transition must not pin a worse
    * explanation in place than a later, identified one.
    */
-  becomeConflicted(holder?: PortHolder): void {
-    this.conflict = portConflictMessage(this.opts.port, holder);
+  becomeConflicted(
+    holder?: PortHolder,
+    message = portConflictMessage(this.opts.port, holder),
+  ): void {
+    this.conflict = message;
     if (this.currentRole === NodeRole.Conflicted) return;
     this.releaseLeader();
     this.setRole(NodeRole.Conflicted);

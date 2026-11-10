@@ -1,3 +1,4 @@
+import { authMismatchMessage } from '../auth-token.js';
 import type { Follower } from './follower.js';
 import {
   identifyPortHolder,
@@ -205,6 +206,11 @@ export class Election {
     // window is the handoff, not a dead leader. Don't undo it by re-binding.
     if (Date.now() < this.yieldUntil) return;
 
+    if (this.follower.leaderRefusedAuth) {
+      this.enterConflicted();
+      return;
+    }
+
     this.log('[election] leader unresponsive — attempting takeover');
     try {
       await this.node.becomeLeader();
@@ -238,6 +244,12 @@ export class Election {
    */
   private enterConflicted(): void {
     this.unresponsiveTicks = 0;
+    // The leader answered, so it is not wedged: naming its pid would ask the user to kill a
+    // healthy server.
+    if (this.follower.leaderRefusedAuth) {
+      this.node.becomeConflicted(undefined, authMismatchMessage(this.node.port));
+      return;
+    }
     const identified = identifyPortHolder(this.node.port, this.probe);
     const holder =
       identified === undefined ? undefined : resumeStoppedHolder(identified, this.probe);

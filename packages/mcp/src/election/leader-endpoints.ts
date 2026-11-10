@@ -9,7 +9,7 @@ import {
 } from '@figwright/shared';
 import { decode, encode } from '@msgpack/msgpack';
 
-import { AUTH_HEADER, localAuthToken, tokensMatch } from '../auth-token.js';
+import { AUTH_HEADER, AUTH_REFUSED_REASON, localAuthToken, tokensMatch } from '../auth-token.js';
 import {
   hasContentType,
   isAccessGateLifted,
@@ -139,7 +139,7 @@ export const attachLeaderEndpoints = (http: HttpServer, deps: LeaderEndpointDeps
     const presented = Array.isArray(header) ? header[0] : header;
     if (!tokensMatch(presented, localAuthToken())) {
       log(`[leader] refused ${req.method ?? '?'} ${req.url ?? '?'} — auth token`);
-      writeJson(res, 403, { error: 'forbidden' });
+      writeJson(res, 403, { error: 'forbidden', reason: AUTH_REFUSED_REASON });
       return;
     }
 

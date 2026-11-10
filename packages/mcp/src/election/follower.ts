@@ -7,7 +7,7 @@ import {
 } from '@figwright/shared';
 import { decode, encode } from '@msgpack/msgpack';
 
-import { AUTH_HEADER, localAuthToken } from '../auth-token.js';
+import { AUTH_HEADER, AUTH_REFUSED_REASON, localAuthToken } from '../auth-token.js';
 import { parseRefusedUpgrades, type RefusedUpgrades } from '../relay/refused-upgrades.js';
 import type { PluginSessionInfo } from '../routing/sessions.js';
 import { ABDICATE_PATH, PING_PATH, RPC_PATH } from './leader-endpoints.js';
@@ -24,6 +24,20 @@ import { ABDICATE_PATH, PING_PATH, RPC_PATH } from './leader-endpoints.js';
  */
 const releaseBody = (res: Response): void => {
   void res.body?.cancel().catch(() => undefined);
+};
+
+/** Reads the body, which releases it as `releaseBody` would. */
+const isAuthRefusal = async (res: Response): Promise<boolean> => {
+  try {
+    const body: unknown = await res.json();
+    return (
+      typeof body === 'object' &&
+      body !== null &&
+      (body as { reason?: unknown }).reason === AUTH_REFUSED_REASON
+    );
+  } catch {
+    return false;
+  }
 };
 
 export const DEFAULT_FOLLOWER_RPC_TIMEOUT_MS = 35_000;
@@ -76,6 +90,7 @@ export interface FollowerOptions {
 
 export class Follower {
   private readonly opts: Required<FollowerOptions>;
+  private authRefused = false;
 
   constructor(opts: FollowerOptions) {
     this.opts = {
@@ -107,6 +122,11 @@ export class Follower {
         headers: this.authHeaders(),
         signal: AbortSignal.timeout(this.opts.pingTimeoutMs),
       });
+      if (res.status === 403) {
+        this.authRefused = await isAuthRefusal(res);
+        return undefined;
+      }
+      this.authRefused = false;
       if (!res.ok) {
         releaseBody(res);
         return undefined;
@@ -116,8 +136,14 @@ export class Follower {
         ? (body as Record<string, unknown>)
         : undefined;
     } catch {
+      this.authRefused = false;
       return undefined;
     }
+  }
+
+  /** True when the last /ping reached a live leader that refused this process's auth token. */
+  get leaderRefusedAuth(): boolean {
+    return this.authRefused;
   }
 
   async ping(): Promise<boolean> {
