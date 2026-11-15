@@ -1,12 +1,14 @@
-import type { BatchResult, FlowStartingPoint } from '@figwright/shared';
+import { type BatchResult, batchRefOrderError, type FlowStartingPoint } from '@figwright/shared';
 
 import type { SandboxHandlers, SandboxToolHandler } from '../dispatcher.js';
+import { readTracks, TRACKS_UNREAD } from '../grid-tracks.js';
 import { ownValue } from '../own-value.js';
 import {
   captureOverrideGuard,
   type InstanceGuard,
   restoreOverrideGuard,
 } from './batch-overrides.js';
+import { opNeedsEarlierResults, resolveOpRefs } from './batch-refs.js';
 import {
   type BindingSnapshot,
   captureBindings,
@@ -881,6 +883,53 @@ const GRID_PROPS = [
   'gridRowGap',
   'gridColumnGap',
 ];
+const isTrackSizes = (key: string): boolean => key === 'gridRowSizes' || key === 'gridColumnSizes';
+
+const GRID_TRACKS_REOPEN =
+  "Figma's plugin runtime has run out of callback ids for this plugin session, which every grid " +
+  'track read spends; ask the user to close and reopen the Figwright plugin, then retry.';
+
+/**
+ * Tracks as Figma will take them back. A HUG track reads with `value: 1`, but a written track that
+ * carries a value is taken as FIXED — `{ type: 'HUG', value: 1 }` reads back FIXED 1, on rows and
+ * columns alike (measured) — so a HUG goes back without one. FIXED and FLEX keep theirs: a FLEX
+ * written without a value reads back FLEX 1.
+ */
+const writableTracks = (tracks: unknown): unknown =>
+  Array.isArray(tracks)
+    ? tracks.map(t =>
+        typeof t === 'object' && t !== null && (t as { type?: unknown }).type === 'HUG'
+          ? { type: 'HUG' }
+          : t,
+      )
+    : tracks;
+
+/**
+ * A grid field back to its captured value, write-if-different. Comparing track sizes reads the live
+ * tracks; if the runtime has run out of callback ids to make them (grid-tracks.ts), the sizes are
+ * left as they are and the key is added to `unchecked`, which the undo reports as residue once
+ * everything else is back. They are not written unread: that would write tracks the comparison may
+ * well have left alone, and what writing a grid's unchanged tracks does to it is not measured.
+ */
+const writeGridProp = (
+  frame: FrameNode,
+  key: string,
+  value: unknown,
+  unchecked: string[],
+): void => {
+  if (!isTrackSizes(key)) {
+    writeIfDifferent(frame, key, value);
+    return;
+  }
+  const bag = frame as unknown as Bag;
+  const current = readTracks(() => toPlainJson(bag[key]));
+  if (current === TRACKS_UNREAD) {
+    unchecked.push(key);
+    return;
+  }
+  if (!same(current, value)) bag[key] = writableTracks(value);
+};
+
 /** How children take cells and whether rows follow them — restored around GRID_PROPS, not in it. */
 const GRID_MODES = ['gridItemsPositioning', 'gridAutoTracks'];
 const AUTO_LAYOUT_BINDINGS = [
@@ -904,7 +953,7 @@ const AUTO_LAYOUT_BINDINGS = [
  * so the rows can only shrink once the children have moved back up. ROW_AUTO_FLOW goes back first
  * so the columns re-flow the children rather than hit an occupied cell.
  */
-const restoreGridTracks = (frame: FrameNode, grid: Bag): void => {
+const restoreGridTracks = (frame: FrameNode, grid: Bag, unchecked: string[]): void => {
   const bag = frame as unknown as Bag;
   if (bag.gridAutoTracks === 'ROWS' && 'gridAutoTracks' in grid) {
     writeIfDifferent(frame, 'gridAutoTracks', 'NONE');
@@ -913,7 +962,7 @@ const restoreGridTracks = (frame: FrameNode, grid: Bag): void => {
     writeIfDifferent(frame, 'gridItemsPositioning', 'ROW_AUTO_FLOW');
   }
   for (const k of ['gridColumnCount', 'gridColumnSizes', 'gridRowGap', 'gridColumnGap']) {
-    if (k in grid) writeIfDifferent(frame, k, grid[k]);
+    if (k in grid) writeGridProp(frame, k, grid[k], unchecked);
   }
   if (bag.gridAutoTracks !== 'ROWS' && (grid.gridRowCount as number) > (bag.gridRowCount as number))
     writeIfDifferent(frame, 'gridRowCount', grid.gridRowCount);
@@ -924,11 +973,11 @@ const restoreGridTracks = (frame: FrameNode, grid: Bag): void => {
  * modes. MANUAL comes back after ROW_AUTO_FLOW's re-flow; Figma then returns each child to the cell
  * it held under MANUAL while that cell survived (measured, through a swap of two children).
  */
-const finishGrid = (frame: FrameNode, grid: Bag): void => {
+const finishGrid = (frame: FrameNode, grid: Bag, unchecked: string[]): void => {
   const bag = frame as unknown as Bag;
   if (bag.gridAutoTracks !== 'ROWS') {
     for (const k of ['gridRowCount', 'gridRowSizes'])
-      if (k in grid) writeIfDifferent(frame, k, grid[k]);
+      if (k in grid) writeGridProp(frame, k, grid[k], unchecked);
   }
   for (const k of GRID_MODES) if (k in grid) writeIfDifferent(frame, k, grid[k]);
 };
@@ -984,8 +1033,23 @@ const autoLayoutInverse: BatchInverse = {
     for (const k of AUTO_LAYOUT_PROPS) if (k in frame) values[k] = bag[k];
     const grid: Bag = {};
     if (frame.layoutMode === 'GRID') {
-      // Track sizes are live objects with setters; keep plain copies.
-      for (const k of GRID_PROPS) grid[k] = toPlainJson(bag[k]);
+      for (const k of GRID_PROPS) if (!isTrackSizes(k)) grid[k] = toPlainJson(bag[k]);
+      // Track sizes are objects with setters; keep plain copies. A grid whose tracks this session
+      // can no longer read (grid-tracks.ts) could not be put back, so the batch is refused before
+      // anything runs.
+      const sizes = readTracks(() => ({
+        rows: toPlainJson(bag.gridRowSizes),
+        columns: toPlainJson(bag.gridColumnSizes),
+      }));
+      if (sizes === TRACKS_UNREAD) {
+        throw new Error(
+          `batch/set_auto_layout: node ${id} is a grid whose track sizes this plugin session can no ` +
+            'longer read, so the batch could not be undone exactly and was not applied. ' +
+            GRID_TRACKS_REOPEN,
+        );
+      }
+      grid.gridRowSizes = sizes.rows;
+      grid.gridColumnSizes = sizes.columns;
       for (const k of GRID_MODES) if (k in frame) grid[k] = bag[k];
     }
     const state: AutoLayoutState = {
@@ -1009,12 +1073,13 @@ const autoLayoutInverse: BatchInverse = {
     // that uses them, set the mode first; back to NONE, write them while the mode still allows it.
     if (s.mode !== 'NONE') writeIfDifferent(frame, 'layoutMode', s.mode);
     for (const [k, v] of Object.entries(s.values)) writeIfDifferent(frame, k, v);
-    restoreGridTracks(frame, s.grid);
+    const unchecked: string[] = [];
+    restoreGridTracks(frame, s.grid, unchecked);
     if (s.mode === 'NONE') writeIfDifferent(frame, 'layoutMode', 'NONE');
     restoreGeometry(frame, s.frame);
     const children = await Promise.all(s.children.map(async c => live(figmaCtx, c.id)));
     restoreChildren(children as (SceneNode | null)[], s.children);
-    finishGrid(frame, s.grid);
+    finishGrid(frame, s.grid, unchecked);
     // Back under MANUAL, the cells Figma remembered are not all there: a column cut while the grid
     // flowed drops the memory of every child it displaced (measured: such a child came back with
     // no cell). The snapshot holds each one's cell, so place the children once more.
@@ -1022,6 +1087,12 @@ const autoLayoutInverse: BatchInverse = {
       restoreChildren(children as (SceneNode | null)[], s.children);
     }
     rebind(frame, s.bindings);
+    if (unchecked.length > 0) {
+      return (
+        `${unchecked.join(' / ')} of grid ${s.id} not checked — this plugin session can no ` +
+        `longer read grid tracks, so they were left as they are. ${GRID_TRACKS_REOPEN}`
+      );
+    }
     return undefined;
   },
   touches: (_params, captured) => [(captured as AutoLayoutState).id],
@@ -2199,6 +2270,11 @@ export const NON_BATCHABLE: Readonly<Record<string, string>> = {
 interface ParsedOp {
   tool: string;
   params: unknown;
+  /**
+   * The op names an earlier op's result (`"$0"`, batch-refs.ts), so it is resolved and captured
+   * just before it applies rather than up front, when what it names does not exist yet.
+   */
+  deferred: boolean;
 }
 
 /**
@@ -2214,7 +2290,7 @@ const parseOps = (params: unknown): ParsedOp[] => {
   const ops = (params as { ops?: unknown } | null)?.ops;
   if (!Array.isArray(ops)) throw new TypeError('batch: ops must be an array');
   if (ops.length === 0) throw new TypeError('batch: ops must not be empty');
-  return ops.map((op, i) => {
+  const parsed = ops.map((op, i) => {
     const o = op as { tool?: unknown; params?: unknown } | null;
     if (typeof o?.tool !== 'string') throw new TypeError(`batch: ops[${i}].tool must be a string`);
     // Own keys only, in both tables: an inherited name (`constructor`, `__proto__`) is neither
@@ -2224,8 +2300,15 @@ const parseOps = (params: unknown): ParsedOp[] => {
       const why = ownValue(NON_BATCHABLE, o.tool) ?? 'only write tools can be batched';
       throw new Error(`batch: op '${o.tool}' (index ${i}) is not batchable — ${why}`);
     }
-    return { tool: o.tool, params: o.params ?? {} };
+    const parsedOp: ParsedOp = { tool: o.tool, params: o.params ?? {}, deferred: false };
+    parsedOp.deferred = opNeedsEarlierResults(parsedOp, i);
+    return parsedOp;
   });
+  // Checked here as well as on the server: a call can reach this handler without passing a server
+  // that knows references (an older leader forwards a newer follower's batch as it came).
+  const misordered = batchRefOrderError(parsed);
+  if (misordered !== null) throw new Error(misordered);
+  return parsed;
 };
 
 /** Containers Figma deletes once their last child leaves — and a deleted node's id is gone. */
@@ -2238,14 +2321,14 @@ const SELF_DELETING = new Set(['GROUP', 'BOOLEAN_OPERATION', 'TRANSFORM_GROUP', 
  */
 const refuseEmptiedContainers = async (
   figmaCtx: typeof figma,
-  ops: readonly ParsedOp[],
+  ops: readonly (readonly [index: number, op: ParsedOp])[],
 ): Promise<void> => {
   const leaving = new Map<
     string,
     { container: BaseNode & ChildrenMixin; ids: Set<string>; ops: Set<string> }
   >();
   /* eslint-disable no-await-in-loop -- few structural ops per batch; read-only */
-  for (const [i, op] of ops.entries()) {
+  for (const [i, op] of ops) {
     const moves = INVERSES[op.tool]!.moves;
     if (moves === undefined) continue;
     const { nodeIds, destinationId } = await moves(figmaCtx, op.params);
@@ -2325,14 +2408,27 @@ export const createBatchHandler =
         throw new Error(`batch: no handler for op '${op.tool}'`);
       }
     }
-    await refuseEmptiedContainers(figmaCtx, ops);
+    // A deferred op's moves cannot be known before what it names exists, so the batch-wide count
+    // covers the others — with none deferred, exactly the count it always was. From the first
+    // deferred op on, each op is checked again against the file as it stands when it is about to
+    // run (below), which is exact without any counting across ops.
+    await refuseEmptiedContainers(
+      figmaCtx,
+      [...ops.entries()].filter(([, op]) => !op.deferred),
+    );
+    const firstDeferred = ops.findIndex(op => op.deferred);
 
     // Phase 1 — capture (read-only). Reads are independent, so resolve them together. A Figma API
     // can reject with a bare string (measured: "Unable to establish connection to Figma after 10
     // seconds"); pass that on as an Error that says nothing was applied yet, rather than raw.
-    let captured: Captured[];
+    // A deferred op is captured in phase 2, just before it applies: the earlier ops are what make
+    // its target exist, and undo runs in reverse, so the state right before it is the state its
+    // undo has to put back.
+    let captured: (Captured | undefined)[];
     try {
-      captured = await Promise.all(ops.map(async op => captureOp(figmaCtx, op)));
+      captured = await Promise.all(
+        ops.map(async op => (op.deferred ? undefined : captureOp(figmaCtx, op))),
+      );
     } catch (err) {
       if (err instanceof Error) throw err;
       throw new Error(`batch: capture failed before any op was applied: ${String(err)}`, {
@@ -2343,10 +2439,19 @@ export const createBatchHandler =
 
     // Phase 2 — apply in order; roll back already-applied ops on the first failure.
     const results: unknown[] = [];
+    const tools = ops.map(op => op.tool);
     /* eslint-disable no-await-in-loop -- apply order is significant and rollback needs partial results */
     for (let i = 0; i < ops.length; i += 1) {
-      const op = ops[i]!;
+      let op = ops[i]!;
       try {
+        if (op.deferred) {
+          // Undo is handed the arguments the op actually ran with, never the references.
+          op = { ...op, params: await resolveOpRefs(figmaCtx, op, i, results, tools) };
+          ops[i] = op;
+        }
+        if (firstDeferred !== -1 && i >= firstDeferred)
+          await refuseEmptiedContainers(figmaCtx, [[i, op]]);
+        if (op.deferred) captured[i] = await captureOp(figmaCtx, op);
         results.push(await apply[op.tool]!(op.params));
       } catch (err) {
         // Unwind applied ops in reverse. Keep going even if one undo throws, but record which ones

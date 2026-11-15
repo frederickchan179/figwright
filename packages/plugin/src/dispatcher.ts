@@ -9,6 +9,7 @@ import {
 } from '../protocol/bridge.js';
 import { withEditorContext } from '../protocol/editor-context.js';
 import { ownValue } from './own-value.js';
+import { noteRuntimeError, RUNTIME_SPENT_NOTE } from './runtime-ids.js';
 
 export type SandboxToolHandler = (params: unknown) => unknown | Promise<unknown>;
 export type SandboxHandlers = Record<string, SandboxToolHandler>;
@@ -62,12 +63,20 @@ const FIGMA_SERVER_SILENT_NOTE =
 /**
  * A handler error as the reply carries it: Figma's "check your internet connection" gets what it
  * means appended and is a TIMEOUT — Figma's own 10 s ran out — rather than an INTERNAL_ERROR that
- * reads as a fault in the plugin. Anything else is INTERNAL_ERROR, as before.
+ * reads as a fault in the plugin. Spent callback ids get the one step that recovers them. Anything
+ * else is INTERNAL_ERROR, as before.
  */
-const toolErrorOf = (message: string): { code: ErrorCode; message: string } =>
-  FIGMA_SERVER_SILENT.test(message)
-    ? { code: ErrorCode.Timeout, message: `${message} (${FIGMA_SERVER_SILENT_NOTE})` }
-    : { code: ErrorCode.Internal, message };
+const toolErrorOf = (message: string): { code: ErrorCode; message: string } => {
+  if (FIGMA_SERVER_SILENT.test(message)) {
+    return { code: ErrorCode.Timeout, message: `${message} (${FIGMA_SERVER_SILENT_NOTE})` };
+  }
+  // Whichever handler meets the overflow first marks the session, so later calls stop making the
+  // objects that would fail (runtime-ids.ts).
+  if (noteRuntimeError(message)) {
+    return { code: ErrorCode.Internal, message: `${message} (${RUNTIME_SPENT_NOTE})` };
+  }
+  return { code: ErrorCode.Internal, message };
+};
 
 export const dispatchSandboxMessage = async (input: DispatchInput): Promise<DispatchOutcome> => {
   if (!isPluginBridgeMessage(input.raw)) return { kind: 'ignore' };

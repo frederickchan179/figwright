@@ -4,6 +4,7 @@ import type { BatchResult } from '@figwright/shared';
 import { describe, expect, it, vi } from 'vitest';
 
 import type { SandboxHandlers } from '../../src/dispatcher.js';
+import { readTracks, resetGridTrackReadsForTests } from '../../src/grid-tracks.js';
 import { createAddComponentPropertyHandler } from '../../src/handlers/add-component-property.js';
 import { createAddVariableModeHandler } from '../../src/handlers/add-variable-mode.js';
 import { createApplyAnimationStyleHandler } from '../../src/handlers/apply-animation-style.js';
@@ -1569,6 +1570,45 @@ describe('batch inverses for the newly batchable writes', () => {
     ]);
   });
 
+  it('undoes a referring op with the ids it ran with, not the references', async () => {
+    // add_variable_mode's undo finds its collection through its own arguments. A reference left in
+    // them ("$0.collectionId") would look up nothing, and the mode would stay in a collection the
+    // batch did not create.
+    const { figmaCtx, store, collections } = makeWide();
+    failingFrame(store);
+    const collection: Record<string, unknown> = {
+      id: 'C:1',
+      name: 'Colour',
+      modes: [{ modeId: 'm1', name: 'Light' }],
+      renameMode: vi.fn<(modeId: string, name: string) => void>(),
+      addMode(name: string) {
+        (collection.modes as unknown[]).push({ modeId: 'm2', name });
+        return 'm2';
+      },
+      removeMode: vi.fn<(id: string) => void>(id => {
+        collection.modes = (collection.modes as { modeId: string }[]).filter(m => m.modeId !== id);
+      }),
+    };
+    collections.set('C:1', collection);
+    const handler = createBatchHandler(figmaCtx, {
+      update_variable_collection: createUpdateVariableCollectionHandler(figmaCtx),
+      add_variable_mode: createAddVariableModeHandler(figmaCtx),
+      set_fills: createSetFillsHandler(figmaCtx),
+    });
+
+    await expect(
+      handler({
+        ops: [
+          { tool: 'update_variable_collection', params: { collectionId: 'C:1', name: 'Color' } },
+          { tool: 'add_variable_mode', params: { collectionId: '$0.collectionId', name: 'Dark' } },
+          FAIL,
+        ],
+      }),
+    ).rejects.toThrow(/op 2 \(set_fills\) failed, rolled back 2 applied op\(s\): /);
+    expect(collection.removeMode).toHaveBeenCalledWith('m2');
+    expect(collection).toMatchObject({ name: 'Colour', modes: [{ modeId: 'm1', name: 'Light' }] });
+  });
+
   // No collection is registered on purpose: the refusal comes from the inverse map, before any
   // lookup, so a batch naming this tool never reaches the document at all.
   it('refuses delete_variable_mode, whose mode id cannot be minted again', async () => {
@@ -2098,7 +2138,14 @@ const makeGrid = (init: {
   const page = node('P0', 'PAGE', null);
   node('F', 'RECTANGLE', page, { fills: [] });
   const grid = node('G', 'FRAME', page);
-  const st = { positioning: init.positioning, autoTracks: init.autoTracks, rows: 2, columns: 3 };
+  const st = {
+    positioning: init.positioning,
+    autoTracks: init.autoTracks,
+    rows: 2,
+    columns: 3,
+    sizeWrites: 0,
+    applied: false,
+  };
   const cell = new Map<TreeNode, [number, number]>();
   const memory = new Map<TreeNode, [number, number]>();
   const kids = ['c0', 'c1', 'c2', 'c3', 'c4'].map(id => node(id, 'RECTANGLE', grid));
@@ -2124,6 +2171,17 @@ const makeGrid = (init: {
     };
   });
   const tracks = (n: number) => Array.from({ length: n }, () => ({ type: 'FLEX', value: 1 }));
+  // Set by a test: the column tracks the grid holds until the first write lands on it, after which
+  // it reads Figma's defaults — enough to make an undo find them different and write them back.
+  let columnTracks: { type: string; value: number }[] | null = null;
+  let lastSizeWrite: unknown = undefined;
+  // Figma's runtime once its callback ids are spent: reads after the first `spendAfter` throw.
+  let spendAfter = Infinity;
+  const trackRead = (n: number) => {
+    if (spendAfter-- <= 0)
+      throw new Error('in <unknown>: Attempted to invoke callback with invalid id -32761');
+    return tracks(n);
+  };
   const props: Record<string, { get: () => unknown; set: (v: never) => void }> = {
     layoutMode: {
       get: () => 'GRID',
@@ -2176,12 +2234,27 @@ const makeGrid = (init: {
         flow();
       },
     },
-    gridRowSizes: { get: () => tracks(st.rows), set: () => undefined },
-    gridColumnSizes: { get: () => tracks(st.columns), set: () => undefined },
+    gridRowSizes: { get: () => trackRead(st.rows), set: () => void st.sizeWrites++ },
+    gridColumnSizes: {
+      get: () => (columnTracks !== null && !st.applied ? columnTracks : trackRead(st.columns)),
+      set: (v: never) => {
+        st.sizeWrites++;
+        lastSizeWrite = v;
+      },
+    },
   };
   for (const [k, d] of Object.entries(props))
     Object.defineProperty(grid, k, { ...d, enumerable: true });
-  Object.assign(grid, { paddingTop: 0, gridRowGap: 0, gridColumnGap: 0 });
+  Object.assign(grid, { paddingTop: 0, gridRowGap: 0 });
+  let columnGap = 0;
+  Object.defineProperty(grid, 'gridColumnGap', {
+    enumerable: true,
+    get: () => columnGap,
+    set: (v: number) => {
+      columnGap = v;
+      st.applied = true;
+    },
+  });
   const handler = createBatchHandler(figmaCtx, {
     set_auto_layout: createSetAutoLayoutHandler(figmaCtx),
     set_fills: createSetFillsHandler(figmaCtx),
@@ -2193,7 +2266,18 @@ const makeGrid = (init: {
     columns: st.columns,
     cells: kids.map(k => cell.get(k)),
   });
-  return { handler, state };
+  return {
+    handler,
+    state,
+    sizeWrites: () => st.sizeWrites,
+    spendOnNextTrackRead: (after: number) => {
+      spendAfter = after;
+    },
+    setColumnTracks: (t: { type: string; value: number }[]) => {
+      columnTracks = t;
+    },
+    lastSizeWrite: () => lastSizeWrite,
+  };
 };
 
 describe('batch inverse for GRID placement modes', () => {
@@ -2247,6 +2331,88 @@ describe('batch inverse for GRID placement modes', () => {
     );
     expect(state()).toEqual(before);
     expect(before.rows).toBe(4);
+  });
+
+  // Each grid track Figma hands out spends callback ids that only reopening the plugin returns
+  // (grid-tracks.ts): once they are spent, a capture cannot read the tracks to promise an undo.
+  const spendRuntime = (): void => {
+    readTracks(() => {
+      throw new Error('in <unknown>: Attempted to invoke callback with invalid id -32761');
+    });
+  };
+
+  it('refuses, before applying anything, a grid op once the runtime has run out', async () => {
+    resetGridTrackReadsForTests();
+    try {
+      const { handler, state } = makeGrid({ positioning: 'MANUAL', autoTracks: 'NONE' });
+      spendRuntime();
+      const before = state();
+      await expect(handler({ ops: [layout({ gridColumnGap: 8 })] })).rejects.toThrow(
+        /can no longer read, so the batch could not be undone exactly and was not applied.*reopen/,
+      );
+      expect(state()).toEqual(before);
+    } finally {
+      resetGridTrackReadsForTests();
+    }
+  });
+
+  it('leaves equal track sizes alone on undo, as write-if-different always did', async () => {
+    resetGridTrackReadsForTests();
+    const { handler, state, sizeWrites } = makeGrid({ positioning: 'MANUAL', autoTracks: 'NONE' });
+    const before = state();
+    await expect(handler({ ops: [layout({ gridColumnGap: 8 }), FAIL] })).rejects.toThrow(
+      /rolled back 1 applied op\(s\)/,
+    );
+    expect(state()).toEqual(before);
+    expect(sizeWrites()).toBe(0);
+  });
+
+  it('leaves the sizes alone and says so when the runtime runs out during the undo', async () => {
+    resetGridTrackReadsForTests();
+    try {
+      const { handler, state, sizeWrites, spendOnNextTrackRead } = makeGrid({
+        positioning: 'MANUAL',
+        autoTracks: 'NONE',
+      });
+      const before = state();
+      // The capture reads both axes; the undo's comparison is the first read to find it spent.
+      spendOnNextTrackRead(2);
+      const error = await Promise.resolve(
+        handler({ ops: [layout({ gridColumnGap: 8 }), FAIL] }),
+      ).catch((e: unknown) => e);
+      // Everything else is put back, and the error says which sizes went unchecked and why.
+      expect(String(error)).toMatch(/rolled back 1 applied op\(s\) \(restored with residue: /);
+      expect(String(error)).toMatch(/gridColumnSizes \/ gridRowSizes of grid G not checked/);
+      expect(String(error)).toMatch(/reopen the Figwright plugin/);
+      expect(state()).toEqual(before);
+      expect(sizeWrites()).toBe(0);
+    } finally {
+      resetGridTrackReadsForTests();
+    }
+  });
+
+  // Figma reads a HUG track with value 1 but takes a written track that has a value as FIXED
+  // (measured on rows and columns alike), so a rollback must hand HUG back without one.
+  it('puts a HUG track back as HUG, without the value Figma would read as FIXED', async () => {
+    resetGridTrackReadsForTests();
+    const { handler, lastSizeWrite, setColumnTracks } = makeGrid({
+      positioning: 'MANUAL',
+      autoTracks: 'NONE',
+    });
+    setColumnTracks([
+      { type: 'FIXED', value: 64 },
+      { type: 'HUG', value: 1 },
+      { type: 'FLEX', value: 2.5 },
+    ]);
+    await expect(handler({ ops: [layout({ gridColumnGap: 8 }), FAIL] })).rejects.toThrow(
+      /rolled back 1 applied op\(s\)/,
+    );
+    // The op left the live tracks reading as Figma's defaults, so the undo writes them back.
+    expect(lastSizeWrite()).toEqual([
+      { type: 'FIXED', value: 64 },
+      { type: 'HUG' },
+      { type: 'FLEX', value: 2.5 },
+    ]);
   });
 });
 
@@ -3016,5 +3182,167 @@ describe('batch inverse for flip_nodes', () => {
       [0, 1, 50],
       [-1, 0, 80],
     ]);
+  });
+});
+
+describe('batch references to earlier ops ("$N")', () => {
+  /** MakeTree plus createFrame, so a create can make a real container later ops move nodes into. */
+  const makeBuildTree = () => {
+    const tree = makeTree();
+    const page = tree.node('P0', 'PAGE', null);
+    let seq = 0;
+    Object.assign(tree.figmaCtx, {
+      currentPage: page,
+      createFrame: () => tree.node(`N:${(seq += 1)}`, 'FRAME', null, { x: 0, y: 0 }),
+    });
+    const handler = createBatchHandler(tree.figmaCtx, {
+      create_frame: createCreateFrameHandler(tree.figmaCtx),
+      reparent_nodes: createReparentNodesHandler(tree.figmaCtx),
+      group_nodes: createGroupNodesHandler(tree.figmaCtx),
+      rename_node: createRenameNodeHandler(tree.figmaCtx),
+      set_position: createSetPositionHandler(tree.figmaCtx),
+      set_fills: createSetFillsHandler(tree.figmaCtx),
+    });
+    return { ...tree, page, handler };
+  };
+
+  it('builds a nested tree in one batch, each op landing in what an earlier one made', async () => {
+    const { page, store, handler } = makeBuildTree();
+
+    const result = (await handler({
+      ops: [
+        { tool: 'create_frame', params: { name: 'Card', parentId: 'P0' } },
+        { tool: 'create_frame', params: { name: 'Row', parentId: '$0' } },
+        { tool: 'create_frame', params: { name: 'Cell', parentId: '$1' } },
+        { tool: 'rename_node', params: { nodeId: '$2', name: 'Cell 1' } },
+        { tool: 'set_position', params: { nodeId: '$1.nodeId', x: 8, y: 4 } },
+      ],
+    })) as BatchResult;
+
+    expect(result.ok).toBe(true);
+    const card = store.get('N:1')!;
+    expect(ids(page)).toEqual(['N:1']);
+    expect(ids(card)).toEqual(['N:2']);
+    expect(ids(store.get('N:2')!)).toEqual(['N:3']);
+    expect(store.get('N:3')!.name).toBe('Cell 1');
+    expect(store.get('N:2')!).toMatchObject({ x: 8, y: 4 });
+  });
+
+  it('rolls the whole tree back when a later op fails, through the ids the references named', async () => {
+    const { page, store, node, handler } = makeBuildTree();
+    node('F', 'RECTANGLE', page, { fills: [] });
+    const a = node('a', 'RECTANGLE', page);
+
+    await expect(
+      handler({
+        ops: [
+          { tool: 'create_frame', params: { name: 'Card', parentId: 'P0' } },
+          { tool: 'create_frame', params: { name: 'Row', parentId: '$0' } },
+          { tool: 'reparent_nodes', params: { nodeIds: ['a'], newParentId: '$1' } },
+          FAIL,
+        ],
+      }),
+    ).rejects.toThrow(/op 3 \(set_fills\) failed, rolled back 3 applied op\(s\)/);
+
+    expect(ids(page)).toEqual(['F', 'a']);
+    expect(a.parent).toBe(page);
+    expect([...store.keys()].filter(k => k.startsWith('N:'))).toEqual([]);
+  });
+
+  it('rolls back what ran when a reference names an id its op did not produce', async () => {
+    const { page, store, handler } = makeBuildTree();
+
+    await expect(
+      handler({
+        ops: [
+          { tool: 'create_frame', params: { name: 'Card', parentId: 'P0' } },
+          { tool: 'rename_node', params: { nodeId: '$0.styleId', name: 'x' } },
+        ],
+      }),
+    ).rejects.toThrow(
+      'batch: op 1 (rename_node) failed, rolled back 1 applied op(s): batch ops[1]: ' +
+        'params.nodeId is "$0.styleId", but op 0 (create_frame) returned no styleId — name one ' +
+        'of its ids instead: "$0.nodeId"',
+    );
+    expect(ids(page)).toEqual([]);
+    expect([...store.keys()].filter(k => k.startsWith('N:'))).toEqual([]);
+  });
+
+  it('refuses a reference to its own or a later op before anything runs', async () => {
+    const { page, handler } = makeBuildTree();
+
+    await expect(
+      handler({
+        ops: [
+          { tool: 'create_frame', params: { name: 'Card', parentId: '$1' } },
+          { tool: 'create_frame', params: { name: 'Row', parentId: 'P0' } },
+        ],
+      }),
+    ).rejects.toThrow('batch ops[0]: params.parentId is "$1", which names op 1');
+    expect(ids(page)).toEqual([]);
+  });
+
+  it('checks a container against the file as it is when the op runs, naming the real op', async () => {
+    // op 1 alone leaves G a child, and op 2 would take the last one: only the file as it stands
+    // when op 2 is about to run shows that — op 1's destination did not exist before the batch.
+    const { page, store, node, handler } = makeBuildTree();
+    const group = node('G', 'GROUP', page);
+    node('a', 'RECTANGLE', group);
+    node('b', 'RECTANGLE', group);
+    const target = node('T', 'FRAME', page);
+
+    await expect(
+      handler({
+        ops: [
+          { tool: 'create_frame', params: { name: 'Holder', parentId: 'P0' } },
+          { tool: 'reparent_nodes', params: { nodeIds: ['a'], newParentId: '$0' } },
+          { tool: 'reparent_nodes', params: { nodeIds: ['b'], newParentId: 'T' } },
+        ],
+      }),
+    ).rejects.toThrow(
+      'batch: op 2 (reparent_nodes) failed, rolled back 2 applied op(s): batch: op 2 ' +
+        '(reparent_nodes) would empty GROUP G, which Figma then deletes',
+    );
+
+    expect(ids(group)).toEqual(['a', 'b']);
+    expect(ids(target)).toEqual([]);
+    expect(store.has('G')).toBe(true);
+    expect([...store.keys()].filter(k => k.startsWith('N:'))).toEqual([]);
+  });
+
+  it('captures a deferred op just before it runs, so the undos unwind in order', async () => {
+    // op 1 (captured up front) moves `a`; op 2 (deferred) takes it into a frame op 0 made. Undoing
+    // op 2 has to put `a` back where op 1 left it, then op 1's undo restores the original x / y.
+    const { page, store, node, handler } = makeBuildTree();
+    node('F', 'RECTANGLE', page, { fills: [] });
+    const a = node('a', 'RECTANGLE', page, { x: 1, y: 2 });
+    node('b', 'RECTANGLE', page);
+
+    await expect(
+      handler({
+        ops: [
+          { tool: 'create_frame', params: { name: 'Holder', parentId: 'P0' } },
+          { tool: 'set_position', params: { nodeId: 'a', x: 30, y: 40 } },
+          { tool: 'reparent_nodes', params: { nodeIds: ['a'], newParentId: '$0' } },
+          FAIL,
+        ],
+      }),
+    ).rejects.toThrow(/op 3 \(set_fills\) failed, rolled back 3 applied op\(s\)/);
+
+    expect(ids(page)).toEqual(['F', 'a', 'b']);
+    expect(a).toMatchObject({ x: 1, y: 2 });
+    expect([...store.keys()].filter(k => k.startsWith('N:'))).toEqual([]);
+  });
+
+  it('leaves "$N" in text and names as the text it is', async () => {
+    const { store, handler } = makeBuildTree();
+
+    await handler({
+      ops: [
+        { tool: 'create_frame', params: { name: '$0', parentId: 'P0' } },
+        { tool: 'rename_node', params: { nodeId: '$0', name: '$5' } },
+      ],
+    });
+    expect(store.get('N:1')!.name).toBe('$5');
   });
 });
