@@ -1,7 +1,14 @@
 import { type BatchResult, batchRefOrderError, type FlowStartingPoint } from '@figwright/shared';
 
+import { isAnnotatable, restoreAnnotations } from '../annotations.js';
 import type { SandboxHandlers, SandboxToolHandler } from '../dispatcher.js';
+import {
+  type DocumentationSnapshot,
+  restoreDocumentation,
+  snapshotDocumentation,
+} from '../documentation.js';
 import { readTracks, TRACKS_UNREAD } from '../grid-tracks.js';
+import { findMeasurement } from '../measurements.js';
 import { ownValue } from '../own-value.js';
 import {
   captureOverrideGuard,
@@ -20,7 +27,6 @@ import {
   captureText,
   type GeometrySnapshot,
   type LayoutScope,
-  loadFonts,
   type Placement,
   type PropsSnapshot,
   rebind,
@@ -44,8 +50,31 @@ import {
   isMotionNode,
   toPlainJson,
 } from './motion-shared.js';
+import { resolveDocumentedComponent } from './set-component-documentation.js';
+import {
+  keyframeDepthOf,
+  assertKeyframeDepthTarget,
+  transform3dTracksOf,
+} from './set-transform-3d.js';
+import {
+  restoreStyle,
+  restoreTextStyle,
+  snapshotStyle,
+  snapshotTextStyle,
+  textStyleWriteScope,
+  type TextStyleSnapshot,
+} from './style-snapshot.js';
 import { isTextLike, type TextLike } from './text-like.js';
+import { captionHint, textHostOf } from './text-sublayer.js';
 import { readFlows, sameFlows } from './update-flows.js';
+import { renameCollection } from './update-variable-collection.js';
+import {
+  parseVariableFields,
+  snapshotVariableFields,
+  type VariableFields,
+  variableFieldsResidue,
+  writeVariableFields,
+} from './variable-fields.js';
 
 /**
  * Atomic batch: apply several invertible write ops as a unit. Two phases —
@@ -83,6 +112,11 @@ interface BatchInverse {
   ): Promise<unknown>;
   /** Nodes the op writes: any instance containing one has its override list guarded. */
   touches?(params: unknown, captured: unknown): readonly string[];
+  /**
+   * The op writes a field `instance.overrides` never lists (batch-hidden.ts), so writing it back
+   * leaves no mark to reset: the instance holding it is reset on undo regardless.
+   */
+  hidden?: true;
   /** Nodes whose box the op can change: the layout region around each is guarded against drift. */
   resizes?(params: unknown, captured: unknown): readonly string[];
   /** For ops that move nodes between containers: which nodes, and where to (null = a new one). */
@@ -144,6 +178,8 @@ interface PropsOptions {
   bindings?: readonly string[];
   /** Whether the write can change the node's box (and so move its neighbours). */
   resizes?: boolean;
+  /** Whether the props are fields `instance.overrides` never lists (BatchInverse.hidden). */
+  hidden?: boolean;
 }
 
 /**
@@ -179,6 +215,7 @@ const propsInverse = (
   ...(opts.resizes === true && {
     resizes: (_params: unknown, captured: unknown) => [(captured as PropsState).id],
   }),
+  ...(opts.hidden === true && { hidden: true as const }),
 });
 
 const STROKE_WEIGHTS = [
@@ -205,20 +242,39 @@ interface TextState {
 }
 
 /** Text op: snapshot the node's characters, every run and its node-level settings. */
-const textInverse = (tool: string): BatchInverse => ({
+/**
+ * The text a text op edits: the node, or a FigJam sticky / shape / table cell / connector's
+ * sublayer. The sublayer carries every run field and setter the snapshot reads and writes, and
+ * lacks only what the snapshot already takes as optional — a box and node-level bindings
+ * (measured).
+ */
+const editedText = (node: BaseNode | null, sublayers: boolean): TextLike | null => {
+  if (node === null) return null;
+  if (isTextLike(node)) return node;
+  return sublayers ? (textHostOf(node) as unknown as TextLike | null) : null;
+};
+
+/** `sublayers`: the tool edits a FigJam caption too (set_text does; the range tools do not). */
+const textInverse = (tool: string, sublayers = false): BatchInverse => ({
   async capture(figmaCtx, params) {
     const id = stringParam(params, 'nodeId', tool);
     const node = await nodeOf(figmaCtx, id, tool);
-    if (!isTextLike(node)) {
-      throw new Error(`batch/${tool}: node ${id} is not a TEXT node or text on a path`);
+    const text = editedText(node, sublayers);
+    if (text === null) {
+      throw new Error(
+        sublayers
+          ? `batch/${tool}: node ${id} is not a TEXT node, text on a path, or a FigJam sticky, ` +
+              'shape with text, table cell or connector'
+          : `batch/${tool}: node ${id} is not a TEXT node or text on a path${captionHint(node)}`,
+      );
     }
-    const state: TextState = { id, text: await captureText(figmaCtx, node) };
+    const state: TextState = { id, text: await captureText(figmaCtx, text) };
     return state;
   },
   async undo(figmaCtx, _params, captured) {
     const { id, text } = captured as TextState;
-    const node = await live(figmaCtx, id);
-    return isTextLike(node) ? restoreText(figmaCtx, node, text) : undefined;
+    const edited = editedText(await live(figmaCtx, id), sublayers);
+    return edited === null ? undefined : restoreText(figmaCtx, edited, text);
   },
   touches: (_params, captured) => [(captured as TextState).id],
   resizes: (_params, captured) => [(captured as TextState).id],
@@ -646,6 +702,7 @@ const complexStrokeInverse: BatchInverse = {
     return undefined;
   },
   touches: (_params, captured) => [(captured as ComplexStrokeState).id],
+  hidden: true,
 };
 
 interface VectorState {
@@ -1447,9 +1504,12 @@ interface StyleState {
 }
 
 /**
- * Update_paint_style / update_effect_style: name, description and the value array (bindings ride on
- * its items, measured to round-trip). A style has no `descriptionMarkdown` at runtime, despite the
- * typings — measured — so `description` is the whole of it.
+ * Update_paint_style / update_effect_style / update_grid_style: name, description, documentation
+ * link and the value array (bindings ride on its items, and a grid's colour on its grid, both
+ * measured to round-trip; a link written back from a snapshot lands as it was, measured). A style
+ * has no `descriptionMarkdown` at runtime, despite the typings — measured — so `description` is the
+ * whole of it. What is recorded and how it goes back is style-snapshot.ts's, shared with the update
+ * handlers' own rollback.
  */
 const styleInverse = (tool: string, type: StyleType, valueProp: string): BatchInverse => ({
   async capture(figmaCtx, params) {
@@ -1457,56 +1517,28 @@ const styleInverse = (tool: string, type: StyleType, valueProp: string): BatchIn
     const style = await figmaCtx.getStyleByIdAsync(id);
     if (style?.type !== type)
       throw new Error(`batch/${tool}: ${type.toLowerCase()} style ${id} not found`);
-    const bag = style as unknown as Bag;
     const state: StyleState = {
       id,
-      values: { name: style.name, description: style.description, [valueProp]: bag[valueProp] },
+      values: snapshotStyle(style, ['name', 'description', 'documentationLinks', valueProp]),
     };
     return state;
   },
   async undo(figmaCtx, _params, captured) {
     const { id, values } = captured as StyleState;
     const style = await figmaCtx.getStyleByIdAsync(id);
-    if (style !== null) for (const [k, v] of Object.entries(values)) writeIfDifferent(style, k, v);
+    if (style !== null) restoreStyle(style, values);
     return undefined;
   },
 });
 
-/** Everything update_text_style (or a binding it applies) can change on a text style. */
-const TEXT_STYLE_PROPS = [
-  'name',
-  'description',
-  'fontName',
-  'fontSize',
-  'lineHeight',
-  'letterSpacing',
-  'paragraphSpacing',
-  'paragraphIndent',
-  'textWrapStyle',
-];
-const TEXT_STYLE_BINDABLE: readonly VariableBindableTextField[] = [
-  'fontFamily',
-  'fontSize',
-  'fontStyle',
-  'fontWeight',
-  'letterSpacing',
-  'lineHeight',
-  'paragraphSpacing',
-  'paragraphIndent',
-];
-
-interface TextStyleState extends StyleState {
-  bindings: Record<string, string | null>;
+interface TextStyleState extends TextStyleSnapshot {
+  id: string;
   consumers: string[];
 }
 
-const textStyleBinding = (style: TextStyle, field: VariableBindableTextField): string | null =>
-  style.boundVariables?.[field]?.id ?? null;
-
 /**
- * Update_text_style: unbind what the op bound, put the raw typography back (fonts loaded — measured
- * to be required even for a size-only write), then re-bind what it unbound. Its consumers re-lay
- * out, so their layout regions are guarded.
+ * Update_text_style: unbind what the op bound, put the raw typography back, then re-bind what it
+ * unbound (style-snapshot.ts). Its consumers re-lay out, so their layout regions are guarded.
  */
 const textStyleInverse: BatchInverse = {
   async capture(figmaCtx, params) {
@@ -1515,34 +1547,20 @@ const textStyleInverse: BatchInverse = {
     if (style?.type !== 'TEXT')
       throw new Error(`batch/update_text_style: text style ${id} not found`);
     const text = style as TextStyle;
-    const bag = text as unknown as Bag;
-    const values: Bag = {};
-    for (const k of TEXT_STYLE_PROPS) values[k] = bag[k];
-    const bindings: Record<string, string | null> = {};
-    for (const f of TEXT_STYLE_BINDABLE) bindings[f] = textStyleBinding(text, f);
+    // What the op can move, by the handler's own rule: a full record used to be taken for every op,
+    // so undoing a rename or a new description loaded the style's face to write typography back
+    // unchanged — and failed, leaving the batch half undone, on a style whose font is not installed.
+    const scope = textStyleWriteScope(params);
+    const snapshot = snapshotTextStyle(text, scope.fields, scope.withBindings);
     const consumers = (await text.getStyleConsumersAsync()).map(c => c.node.id);
-    const state: TextStyleState = { id, values, bindings, consumers };
+    const state: TextStyleState = { id, ...snapshot, consumers };
     return state;
   },
   async undo(figmaCtx, _params, captured) {
     const s = captured as TextStyleState;
     const style = (await figmaCtx.getStyleByIdAsync(s.id)) as TextStyle | null;
     if (style === null) return undefined;
-    await loadFonts(figmaCtx, [s.values.fontName as FontName, style.fontName]);
-    for (const f of TEXT_STYLE_BINDABLE) {
-      if (s.bindings[f] === null && textStyleBinding(style, f) !== null)
-        style.setBoundVariable(f, null);
-    }
-    for (const [k, v] of Object.entries(s.values)) writeIfDifferent(style, k, v);
-    /* eslint-disable no-await-in-loop -- a style has at most eight bindable fields */
-    for (const f of TEXT_STYLE_BINDABLE) {
-      const id = s.bindings[f];
-      if (id === null || id === undefined || textStyleBinding(style, f) === id) continue;
-      const variable = await figmaCtx.variables.getVariableByIdAsync(id);
-      if (variable === null) throw new Error(`variable ${id} bound to ${f} no longer exists`);
-      style.setBoundVariable(f, variable);
-    }
-    /* eslint-enable no-await-in-loop */
+    await restoreTextStyle(figmaCtx, style, s);
     return undefined;
   },
   resizes: (_params, captured) => (captured as TextStyleState).consumers,
@@ -1652,10 +1670,38 @@ const renameVariableInverse: BatchInverse = {
   },
 };
 
+interface VariableFieldsState {
+  id: string;
+  before: VariableFields;
+}
+
+/**
+ * Undo for update_variable: the fields the op names, as they were — the handler's own rule
+ * (variable-fields.ts), so a rollback and the handler's own put back the same thing.
+ */
+const updateVariableInverse: BatchInverse = {
+  async capture(figmaCtx, params) {
+    const id = stringParam(params, 'variableId', 'update_variable');
+    const variable = await figmaCtx.variables.getVariableByIdAsync(id);
+    if (variable === null) throw new Error(`batch/update_variable: variable ${id} not found`);
+    const fields = parseVariableFields(params, 'batch/update_variable');
+    return { id, before: snapshotVariableFields(variable, fields) } satisfies VariableFieldsState;
+  },
+  async undo(figmaCtx, _params, captured) {
+    const was = captured as VariableFieldsState;
+    const variable = await figmaCtx.variables.getVariableByIdAsync(was.id);
+    if (variable === null) return undefined;
+    writeVariableFields(variable, was.before);
+    const left = variableFieldsResidue(variable, was.before);
+    return left.length === 0 ? undefined : `variable ${was.id}: ${left.join(', ')} still differ`;
+  },
+};
+
 interface CollectionNames {
   id: string;
   name: string;
   modes: { modeId: string; name: string }[];
+  hiddenFromPublishing: boolean;
 }
 
 /**
@@ -1677,19 +1723,141 @@ const updateVariableCollectionInverse: BatchInverse = {
       id,
       name: collection.name,
       modes: collection.modes.map(mode => ({ modeId: mode.modeId, name: mode.name })),
+      hiddenFromPublishing: collection.hiddenFromPublishing,
     } satisfies CollectionNames;
   },
   async undo(figmaCtx, _params, captured) {
     const was = captured as CollectionNames;
     const collection = await figmaCtx.variables.getVariableCollectionByIdAsync(was.id);
     if (collection === null) return undefined;
-    if (collection.name !== was.name) collection.name = was.name;
+    renameCollection(collection, was.name);
     for (const mode of was.modes) {
       if (collection.modes.some(m => m.modeId === mode.modeId && m.name !== mode.name)) {
         collection.renameMode(mode.modeId, mode.name);
       }
     }
+    if (collection.hiddenFromPublishing !== was.hiddenFromPublishing) {
+      collection.hiddenFromPublishing = was.hiddenFromPublishing;
+    }
     return undefined;
+  },
+};
+
+// ── Annotations ──────────────────────────────────────────────────────────────
+
+/**
+ * Undo for set_annotations: the node's annotations as they were, written back by the side each was
+ * written with (annotations.ts) — writing every one back as markdown, or every one as plain text,
+ * changes some (measured). A list that still differs is reported, not claimed restored.
+ */
+const annotationsInverse: BatchInverse = {
+  async capture(figmaCtx, params) {
+    const id = stringParam(params, 'nodeId', 'set_annotations');
+    const node = await figmaCtx.getNodeByIdAsync(id);
+    // A node that is missing or keeps no annotations is left to the op, whose refusal says which —
+    // nothing can have been written to it, so there is nothing to undo.
+    if (node === null || !isAnnotatable(node)) return null;
+    return { id, annotations: JSON.parse(JSON.stringify(node.annotations)) as Annotation[] };
+  },
+  async undo(figmaCtx, _params, captured) {
+    if (captured === null) return undefined;
+    const was = captured as { id: string; annotations: Annotation[] };
+    const node = await figmaCtx.getNodeByIdAsync(was.id);
+    if (node === null || !isAnnotatable(node)) return undefined;
+    const off = restoreAnnotations(node, was.annotations);
+    return off === undefined ? undefined : `node ${was.id}: ${off}`;
+  },
+};
+
+interface CategoryState {
+  id: string;
+  label: string;
+  color: AnnotationCategoryColor;
+  isPreset: boolean;
+}
+
+/**
+ * Undo for update_annotation_category: its label and colour back. A preset that the op renamed or
+ * recoloured stays a custom category — Figma has nothing that makes one a preset again — and that
+ * is reported.
+ */
+const annotationCategoryInverse: BatchInverse = {
+  async capture(figmaCtx, params) {
+    const id = stringParam(params, 'categoryId', 'update_annotation_category');
+    const category = await figmaCtx.annotations.getAnnotationCategoryByIdAsync(id);
+    if (category === null) {
+      throw new Error(`batch/update_annotation_category: annotation category ${id} not found`);
+    }
+    return {
+      id,
+      label: category.label,
+      color: category.color,
+      isPreset: category.isPreset,
+    } satisfies CategoryState;
+  },
+  async undo(figmaCtx, _params, captured) {
+    const was = captured as CategoryState;
+    const category = await figmaCtx.annotations.getAnnotationCategoryByIdAsync(was.id);
+    if (category === null) return undefined;
+    if (category.color !== was.color) category.setColor(was.color);
+    if (category.label !== was.label) category.setLabel(was.label);
+    return was.isPreset && !category.isPreset
+      ? `annotation category ${was.id} "${was.label}" is no longer one of Figma's presets, and nothing makes it one again`
+      : undefined;
+  },
+};
+
+// ── Measurements ─────────────────────────────────────────────────────────────
+
+/** Undo for update_measurement: its offset and text as they were. */
+const measurementInverse: BatchInverse = {
+  async capture(figmaCtx, params) {
+    const id = stringParam(params, 'measurementId', 'update_measurement');
+    // One no page has is left to the op, whose refusal says so — it can have changed nothing.
+    const found = await findMeasurement(figmaCtx, id, 'batch/update_measurement').catch(() => null);
+    if (found === null) return null;
+    return { id, offset: { ...found.measurement.offset }, freeText: found.measurement.freeText };
+  },
+  async undo(figmaCtx, _params, captured) {
+    if (captured === null) return undefined;
+    const was = captured as { id: string; offset: MeasurementOffset; freeText: string };
+    const { page } = await findMeasurement(figmaCtx, was.id, 'batch/update_measurement');
+    page.editMeasurement(was.id, { offset: was.offset, freeText: was.freeText });
+    return undefined;
+  },
+};
+
+// ── Component documentation ──────────────────────────────────────────────────
+
+interface DocumentationState extends DocumentationSnapshot {
+  id: string;
+}
+
+/**
+ * Undo for set_component_documentation: the description (both forms) and the link, whatever the op
+ * names — a plain description rewrites the markdown too. Writing the old plain text back would lose
+ * the old formatting, and writing the old markdown back would turn plain text such as `[x](y)` into
+ * a link (both measured), so restoreDocumentation writes whichever reproduces the snapshot and
+ * checks that it did; a description it cannot put back exactly is reported, not claimed restored.
+ */
+const componentDocumentationInverse: BatchInverse = {
+  async capture(figmaCtx, params) {
+    const id = stringParam(params, 'nodeId', 'set_component_documentation');
+    const node = await resolveDocumentedComponent(
+      figmaCtx,
+      id,
+      'batch/set_component_documentation',
+    );
+    return { id, ...snapshotDocumentation(node) } satisfies DocumentationState;
+  },
+  async undo(figmaCtx, _params, captured) {
+    const was = captured as DocumentationState;
+    const node = await figmaCtx.getNodeByIdAsync(was.id);
+    if (node?.type !== 'COMPONENT' && node?.type !== 'COMPONENT_SET') return undefined;
+    const off = restoreDocumentation(node, was);
+    return off === undefined
+      ? undefined
+      : `${node.type === 'COMPONENT' ? 'component' : 'component set'} ${was.id}: ${off}`;
   },
 };
 
@@ -1974,16 +2142,31 @@ const keyframeTrackInverse = (tool: string): BatchInverse => ({
     if (node === null || !isMotionNode(node)) {
       throw new Error(`batch/${tool}: node ${id} not found or does not support Motion`);
     }
+    assertKeyframeDepthTarget(node, p.field, `batch/${tool}`);
     const tracks = node.manualKeyframeTracks as Record<string, unknown>;
     const previous = tracks[field.name];
+    // A 3D track's baseValue is the transform's (or the scene's) own value, and applying one can
+    // turn a transform on or make a scene (measured) — so that goes back too.
+    const drives = keyframeDepthOf(p.field);
+    const depth =
+      drives === null
+        ? undefined
+        : toPlainJson((node as unknown as Record<string, unknown>)[drives] ?? null);
     // Deep-clone so the snapshot can't be mutated by the apply that follows.
-    return { id, field: p.field, previous: previous === undefined ? null : toPlainJson(previous) };
+    return {
+      id,
+      field: p.field,
+      previous: previous === undefined ? null : toPlainJson(previous),
+      ...(drives !== null && { drives, depth }),
+    };
   },
   async undo(figmaCtx, _params, captured) {
-    const { id, field, previous } = captured as {
+    const { id, field, previous, drives, depth } = captured as {
       id: string;
       field: KeyframeField;
       previous: ManualKeyframeTrackInput | null;
+      drives?: 'transform3d' | 'scene3d';
+      depth?: unknown;
     };
     const node = await figmaCtx.getNodeByIdAsync(id);
     if (node === null || !isMotionNode(node)) return undefined;
@@ -1995,10 +2178,71 @@ const keyframeTrackInverse = (tool: string): BatchInverse => ({
     } else if (now === undefined || !same(toPlainJson(now), previous)) {
       node.applyManualKeyframeTrack(field, previous);
     }
+    if (drives !== undefined) {
+      const bag = node as unknown as Record<string, unknown>;
+      if (!same(toPlainJson(bag[drives] ?? null), depth)) bag[drives] = depth;
+    }
     return undefined;
   },
   touches: (_params, captured) => [(captured as { id: string }).id],
 });
+
+interface Transform3dState {
+  id: string;
+  transform3d?: unknown;
+  transformOrigin?: unknown;
+  scene3d?: unknown;
+}
+
+/**
+ * Set_transform_3d: put the transform, its origin and the scene back. Two writes are refused, since
+ * a rollback could not undo them: removing a transform deletes the node's 3D keyframe tracks (put
+ * back, a track gets new ids — measured in #78), and an imported FREEFORM transform cannot be
+ * assigned at all. Writing the old values back also puts back the baseValue of a 3D track, which is
+ * the same value (measured).
+ */
+const transform3dInverse: BatchInverse = {
+  async capture(figmaCtx, params) {
+    const tool = 'set_transform_3d';
+    const id = stringParam(params, 'nodeId', tool);
+    const node = await nodeOf(figmaCtx, id, tool);
+    const asked = paramsOf(params).transform3d as { type?: unknown } | undefined;
+    const bag = node as unknown as Bag;
+    const current = bag.transform3d as Transform3d | undefined;
+    if (asked !== undefined && current?.type === 'FREEFORM') {
+      throw new Error(
+        `batch/${tool}: node ${id} has an imported FREEFORM transform, which the plugin API cannot ` +
+          'set back — run this outside the batch',
+      );
+    }
+    const tracks = transform3dTracksOf(node);
+    if (asked?.type === 'NONE' && tracks.length > 0) {
+      throw new Error(
+        `batch/${tool}: removing node ${id}'s 3D transform also deletes its keyframe tracks ` +
+          `${tracks.join(', ')}, which a rollback cannot bring back as they were — run this ` +
+          'outside the batch',
+      );
+    }
+    const state: Transform3dState = { id };
+    for (const key of ['transform3d', 'transformOrigin', 'scene3d'] as const) {
+      if (key in node) state[key] = toPlainJson(bag[key] ?? null);
+    }
+    return state;
+  },
+  async undo(figmaCtx, _params, captured) {
+    const state = captured as Transform3dState;
+    const node = await live(figmaCtx, state.id);
+    if (node === null) return undefined;
+    const bag = node as unknown as Bag;
+    // The origin first, the scene last: the order the handler writes them in.
+    for (const key of ['transformOrigin', 'transform3d', 'scene3d'] as const) {
+      if (key in state && !same(toPlainJson(bag[key] ?? null), state[key])) bag[key] = state[key];
+    }
+    return undefined;
+  },
+  touches: (_params, captured) => [(captured as Transform3dState).id],
+  hidden: true,
+};
 
 const setTimelineDurationInverse: BatchInverse = {
   async capture(figmaCtx, params) {
@@ -2104,7 +2348,7 @@ const INVERSES: Readonly<Record<string, BatchInverse>> = {
   set_layout_grids: propsInverse('set_layout_grids', ['layoutGrids']),
   rename_node: propsInverse('rename_node', ['name']),
   // Text.
-  set_text: textInverse('set_text'),
+  set_text: textInverse('set_text', true),
   set_text_properties: textPropertiesInverse,
   set_text_range: textInverse('set_text_range'),
   find_replace_text: findReplaceInverse,
@@ -2169,8 +2413,9 @@ const INVERSES: Readonly<Record<string, BatchInverse>> = {
   repeat_nodes: repeatInverse,
   // The group's box follows its copies, so the layout around it is guarded.
   set_repeat: propsInverse('set_repeat', ['transformModifiers'], { resizes: true }),
-  set_text_path: propsInverse('set_text_path', ['textPathStartData']),
+  set_text_path: propsInverse('set_text_path', ['textPathStartData'], { hidden: true }),
   set_complex_stroke: complexStrokeInverse,
+  set_transform_3d: transform3dInverse,
   set_vector: vectorInverse,
   outline_stroke: outlineInverse,
   combine_as_variants: combineInverse,
@@ -2185,6 +2430,7 @@ const INVERSES: Readonly<Record<string, BatchInverse>> = {
   create_shape: createInverse('create_shape'),
   create_component: createComponentInverse,
   create_section: createInverse('create_section'),
+  create_connector: createInverse('create_connector'),
   import_image: createInverse('import_image'),
   import_svg: createInverse('import_svg'),
   create_vector: createInverse('create_vector'),
@@ -2211,13 +2457,28 @@ const INVERSES: Readonly<Record<string, BatchInverse>> = {
   // Styles.
   update_paint_style: styleInverse('update_paint_style', 'PAINT', 'paints'),
   update_effect_style: styleInverse('update_effect_style', 'EFFECT', 'effects'),
+  update_grid_style: styleInverse('update_grid_style', 'GRID', 'layoutGrids'),
   update_text_style: textStyleInverse,
   // Variables.
   set_variable_value: variableValueInverse,
   set_variable_code_syntax: codeSyntaxInverse,
   rename_variable: renameVariableInverse,
+  update_variable: updateVariableInverse,
+  // Annotations.
+  set_annotations: annotationsInverse,
+  create_annotation_category: createdInverse('categoryId', async (figmaCtx, id) => {
+    (await figmaCtx.annotations.getAnnotationCategoryByIdAsync(id))?.remove();
+  }),
+  update_annotation_category: annotationCategoryInverse,
+  // Measurements.
+  add_measurement: createdInverse('measurementId', async (figmaCtx, id) => {
+    const { page } = await findMeasurement(figmaCtx, id, 'batch/add_measurement');
+    page.deleteMeasurement(id);
+  }),
+  update_measurement: measurementInverse,
   update_variable_collection: updateVariableCollectionInverse,
   // Component properties.
+  set_component_documentation: componentDocumentationInverse,
   edit_component_property: editPropertyInverse,
   bind_component_property: bindPropertyInverse,
   // Prototype and pages.
@@ -2250,6 +2511,9 @@ export const NON_BATCHABLE: Readonly<Record<string, string>> = {
     'a deleted variable cannot be brought back under its id, and its bindings revert',
   delete_variable_mode:
     'adding a mode back mints a new mode id, so the value every variable held for the removed one does not return',
+  delete_measurement: 'adding a measurement back mints a new id',
+  delete_annotation_category:
+    'a deleted category cannot be brought back under its id, and the annotations that used it keep the old one',
   delete_variable_collection:
     'a deleted collection cannot be brought back under its id, nor its variables and modes',
   delete_component_property:
@@ -2371,7 +2635,7 @@ const captureOp = async (figmaCtx: typeof figma, op: ParsedOp): Promise<Captured
   const touched = inverse.touches?.(op.params, state) ?? [];
   const resized = inverse.resizes?.(op.params, state) ?? [];
   const [guard, layout] = await Promise.all([
-    touched.length > 0 ? captureOverrideGuard(figmaCtx, touched) : [],
+    touched.length > 0 ? captureOverrideGuard(figmaCtx, touched, inverse.hidden === true) : [],
     resized.length > 0 ? captureLayoutScope(figmaCtx, resized) : [],
   ]);
   return { state, guard, layout };

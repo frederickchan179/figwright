@@ -123,6 +123,8 @@ describe('normalizeIdArgs', () => {
       'animationStyleId', // Motion applied-style instance ids
       'timelineId', // Motion timeline ids
       'sessionId', // relay plugin-session ids (id-…), a server-side handle, never on the canvas
+      'categoryId', // annotation-category ids — shaped like a node id (127:0) but never on the canvas
+      'measurementId', // Dev Mode measurement ids — shaped like a node id, but not a canvas node
     ]);
     const covered = new Set<string>([...STRING_ID_FIELDS, 'nodeIds']);
     const offenders: string[] = [];

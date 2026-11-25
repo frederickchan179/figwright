@@ -10,11 +10,18 @@ the system has no equivalent, and name it to fit the system's conventions
 
 Build the collection top-down — the collection hands you the mode id you need to set values.
 
-1. **`create_variable_collection`** (`name`) → returns `{ collectionId, defaultModeId }`. Figma
-   auto-creates one mode; **keep `defaultModeId`** — `set_variable_value` needs a `modeId`.
+1. **`create_variable_collection`** (`name`) → returns `{ collectionId, defaultModeId,
+   hiddenFromPublishing }`. Figma auto-creates one mode; **keep `defaultModeId`** —
+   `set_variable_value` needs a `modeId`. A collection created here starts **hidden from
+   publishing** (one made in the Figma UI does not), so its tokens are left out when the file is
+   published as a library: pass `hiddenFromPublishing: false` for a design system meant to be
+   shared, or flip it later with `update_variable_collection`.
 2. **`create_variable`** (`name`, `collectionId`, `resolvedType`: `COLOR` / `FLOAT` / `STRING` /
-   `BOOLEAN`). Group with slashes in the name (`color/primary`, `space/md`) — that's the folder
-   structure the picker and `get_variable_defs` show back.
+   `BOOLEAN`, optional `scopes` / `description` / `hiddenFromPublishing`). Group with slashes in the
+   name (`color/primary`, `space/md`) — that's the folder structure the picker and
+   `get_variable_defs` show back. Give `scopes` when the token is for one kind of field (a radius
+   token `["CORNER_RADIUS"]`, a gap `["GAP"]`), and `[]` for a **primitive** that semantic tokens
+   alias, which keeps it out of the pickers. A `description` says what the token is for.
 3. **`set_variable_value`** (`variableId`, `modeId`, `value`) per mode. `value` shape follows the
    type: a number for `FLOAT`, a string for `STRING`, a boolean for `BOOLEAN`, `{ r, g, b, a }`
    (0–1) for `COLOR` — add `space: "SRGB"` when the colour comes from code (see the colour-space
@@ -64,9 +71,11 @@ bare `"$0"` reads the id its argument asks for (`collectionId` → the collectio
 
 **Known limits (grounded, expected — not bugs):**
 
-- **No scope control.** `create_variable` has no `scopes` parameter, so a new variable defaults to
-  _all scopes_ (it shows up everywhere in the picker). Codegen doesn't read scopes, so this is a
-  picker-UX nicety, not a correctness issue — note it if the user wanted a scoped token.
+- **Editing a variable later**: `update_variable` (`variableId` + any of `name`, `description`,
+  `scopes`, `hiddenFromPublishing`) changes it in place — id, values and bindings stay. Each type
+  takes only some scopes (a COLOR takes the fill / stroke / effect colour ones, a STRING text content
+  and font names, a BOOLEAN only `ALL_SCOPES`, EASING / TIMING none); a refusal names the ones it
+  takes. A variable from a library is read-only here.
 - **Modes are plan-gated.** `add_variable_mode` (e.g. a `Dark` mode) fails with
   `Limited to 1 modes only` on free/Starter files — the tool is faithfully surfacing Figma's plan
   limit. Don't stop at the error: fall back to a **paired collection** — create a second collection
@@ -89,10 +98,14 @@ an orphan collection behind.
   the closest named instance. `get_fonts` reports which axes a family accepts under `variationAxes`.
 - Effect / grid styles have their own create tools.
 - **Editing an existing style** (the design system already has it, and code changed its value): use
-  `update_paint_style` / `update_text_style` / `update_effect_style` (`styleId` + only the fields that
-  changed; omitted fields stay as-is) — **don't** `create_*` a second style with the same name, which
-  leaves a duplicate. Re-syncing a style ramp from code is the common case; `get_styles` gives you the
-  `styleId`s to target.
+  `update_paint_style` / `update_text_style` / `update_effect_style` / `update_grid_style`
+  (`styleId` + only the fields that changed; omitted fields stay as-is) — **don't** `create_*` a
+  second style with the same name, which leaves a duplicate, and don't delete and recreate one: a new
+  style is a new id, and every node that used the old one loses it. Re-syncing a style ramp from code
+  is the common case; `get_styles` gives you the `styleId`s to target.
+- **Documenting a style**: every style `create_*` / `update_*` takes `description` (plain text — a
+  style has no rich-text description) and `documentationLinks` (at most one `{ uri }`, scheme
+  included; `[]` removes it). `get_styles` returns the links only with `documentation: true`.
 - **A value the style binds to a variable is a reference, not a literal.** `get_styles` reports those
   bindings as `boundVariables` (`{ field: variableId }`) on the paint / effect / layout grid that
   owns them — and on the text style itself for typography — with `variables` naming each id. Paints

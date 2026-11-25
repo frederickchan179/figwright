@@ -1360,6 +1360,54 @@ describe('serializeFlat — layout sizing / constraints / clipsContent', () => {
     expect(serializeFlatSync(fake({ type: 'FRAME', layoutGrids: [] })).layoutGrids).toBeUndefined();
   });
 
+  // The overlay colour, read so a grid written back from get_node keeps it: every write used to
+  // reset it to Figma's red at 10%. As Figma holds it (float32), like a paint's colour.
+  it("carries each grid's colour as Figma holds it, and nothing where a grid has none", () => {
+    const out = serializeFlatSync(
+      fake({
+        type: 'FRAME',
+        layoutGrids: [
+          {
+            pattern: 'GRID',
+            visible: true,
+            sectionSize: 8,
+            color: { r: 1, g: 0, b: 0, a: 0.10000000149011612 },
+          },
+          {
+            pattern: 'COLUMNS',
+            visible: false,
+            count: 4,
+            gutterSize: 10,
+            alignment: 'MIN',
+            offset: 8,
+            color: { r: 0.1, g: 0.2, b: 0.3, a: 0.37 },
+            boundVariables: { gutterSize: { type: 'VARIABLE_ALIAS', id: 'V:1' } },
+          },
+          { pattern: 'ROWS', visible: true, count: 2, gutterSize: 4, alignment: 'STRETCH' },
+        ],
+      }),
+    );
+    expect(out.layoutGrids).toEqual([
+      {
+        pattern: 'GRID',
+        visible: true,
+        sectionSize: 8,
+        color: { r: 1, g: 0, b: 0, a: 0.10000000149011612 },
+      },
+      {
+        pattern: 'COLUMNS',
+        visible: false,
+        count: 4,
+        gutterSize: 10,
+        alignment: 'MIN',
+        offset: 8,
+        color: { r: 0.1, g: 0.2, b: 0.3, a: 0.37 },
+        boundVariables: { gutterSize: 'V:1' },
+      },
+      { pattern: 'ROWS', visible: true, count: 2, gutterSize: 4, alignment: 'STRETCH' },
+    ]);
+  });
+
   it('surfaces overflowDirection on a scrolling frame, omits the NONE default', () => {
     expect(
       serializeFlatSync(fake({ type: 'FRAME', overflowDirection: 'VERTICAL' })).overflowDirection,
@@ -2721,6 +2769,16 @@ describe('serializer — variable bindings on paints / effects / grids', () => {
       },
     ]);
   });
+
+  it('surfaces a SHAPE_WITH_TEXT node’s caption via its text sublayer', () => {
+    const out = serializeFlatSync(
+      fake({
+        type: 'SHAPE_WITH_TEXT',
+        text: { characters: 'Deliver quote' },
+      }),
+    );
+    expect(out.characters).toBe('Deliver quote');
+  });
 });
 
 describe('orientation', () => {
@@ -2775,6 +2833,67 @@ describe('orientation', () => {
       expect(out.cssTransform).toBeUndefined();
     },
   );
+});
+
+describe('3D transforms', () => {
+  const turn = {
+    type: 'FIXED_ORDER',
+    translateZ: 0,
+    rotateX: 0,
+    rotateY: 45.00000125223908,
+    rotateZ: 0,
+    backfaceVisible: true,
+    visible: true,
+  };
+  const centre = { x: { unit: 'PERCENT', value: 50 }, y: { unit: 'PERCENT', value: 50 } };
+
+  it('reads a node turned in depth beside its 2D turn, which it leaves as it was', () => {
+    const c = Math.cos(Math.PI / 6);
+    const s = Math.sin(Math.PI / 6);
+    const out = serializeFlatSync(
+      fake({
+        type: 'RECTANGLE',
+        rotation: -30,
+        relativeTransform: [
+          [c, s, 10],
+          [-s, c, 20],
+        ],
+        transform3d: turn,
+        transformOrigin: centre,
+      }),
+    );
+    expect(out).toMatchObject({
+      cssTransform: 'rotate(-30deg)',
+      transform3d: { type: 'FIXED_ORDER', rotateY: 45 },
+      cssTransform3d:
+        'translate(50%, 50%) translateZ(0px) rotateX(0deg) rotateY(45deg) rotateZ(0deg) ' +
+        'translate(-50%, -50%)',
+    });
+    expect(out).not.toHaveProperty('transformOrigin');
+  });
+
+  it('reads a frame’s scene, an instance inheriting one reads the same way', () => {
+    for (const type of ['FRAME', 'INSTANCE']) {
+      const out = serializeFlatSync(
+        fake({
+          type,
+          transform3d: { type: 'NONE' },
+          transformOrigin: centre,
+          scene3d: { perspective: 600, preserve3d: true, visible: true },
+          children: [],
+        }),
+      );
+      expect(out.scene3d).toEqual({ perspective: 600, preserve3d: true });
+      expect(out).not.toHaveProperty('transform3d');
+    }
+  });
+
+  it('reads nothing 3D from a node without it, or in a Figma that predates it', () => {
+    const out = serializeFlatSync(fake({ type: 'RECTANGLE' }));
+    for (const key of ['transform3d', 'transformOrigin', 'cssTransform3d', 'scene3d']) {
+      expect(out).not.toHaveProperty(key);
+    }
+  });
 });
 
 describe('Figma Draw nodes', () => {
@@ -3044,5 +3163,65 @@ describe('Figma Draw nodes', () => {
     });
     expect(out).not.toHaveProperty('complexStrokeProperties');
     expect(out).not.toHaveProperty('renderBounds');
+  });
+});
+
+describe('FigJam captions and connectors', () => {
+  it('reads the words a sticky, shape with text, table cell or connector keeps in its sublayer', () => {
+    for (const type of ['STICKY', 'SHAPE_WITH_TEXT', 'TABLE_CELL', 'CONNECTOR']) {
+      expect(
+        serializeFlatSync(fake({ type, text: { characters: `${type} words` } })).characters,
+      ).toBe(`${type} words`);
+    }
+  });
+
+  it('reads no words off a node of another type that happens to have a `text` field', () => {
+    expect(
+      serializeFlatSync(fake({ type: 'FRAME', text: { characters: 'x' } })).characters,
+    ).toBeUndefined();
+  });
+
+  // Measured: a floating end reads back attached to the page at its position, even inside a
+  // section — that id says nothing, so it is left out; an end attached to a node keeps its id.
+  it('reads a connector’s ends as create_connector takes them, a floating end without the page id', () => {
+    const page = { id: '0:1', type: 'PAGE', parent: null };
+    const section = { id: '7:1', type: 'SECTION', parent: page };
+    const out = serializeFlatSync(
+      fake({
+        type: 'CONNECTOR',
+        parent: section,
+        text: { characters: '' },
+        connectorStart: { endpointNodeId: '0:1', position: { x: 10, y: 10 } },
+        connectorEnd: { endpointNodeId: '5:5', magnet: 'LEFT' },
+        connectorLineType: 'ELBOWED',
+        connectorStartStrokeCap: 'NONE',
+        connectorEndStrokeCap: 'ARROW_LINES',
+      }),
+    );
+    expect(out).toMatchObject({
+      connectorStart: { position: { x: 10, y: 10 } },
+      connectorEnd: { endpointNodeId: '5:5', magnet: 'LEFT' },
+      connectorLineType: 'ELBOWED',
+      connectorStartStrokeCap: 'NONE',
+      connectorEndStrokeCap: 'ARROW_LINES',
+    });
+    expect(out.connectorStart).not.toHaveProperty('endpointNodeId');
+
+    const atPoint = serializeFlatSync(
+      fake({
+        type: 'CONNECTOR',
+        parent: page,
+        text: { characters: '' },
+        connectorStart: { endpointNodeId: '5:5', position: { x: 240, y: 120 } },
+        connectorEnd: { endpointNodeId: '0:1', position: { x: 0, y: 0 } },
+      }),
+    );
+    expect(atPoint.connectorStart).toEqual({ endpointNodeId: '5:5', position: { x: 240, y: 120 } });
+    expect(atPoint.connectorEnd).toEqual({ position: { x: 0, y: 0 } });
+  });
+
+  it('reads no connector fields off anything else', () => {
+    const out = serializeFlatSync(fake({ connectorStart: { position: { x: 0, y: 0 } } }));
+    expect(out.connectorStart).toBeUndefined();
   });
 });

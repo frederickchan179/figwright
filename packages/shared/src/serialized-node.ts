@@ -353,10 +353,24 @@ export const SerializedLayoutGridSchema = z.object({
   gutterSize: z.number().optional(),
   alignment: z.string().optional(),
   offset: z.number().optional(),
+  /**
+   * The grid's colour in the editor, r / g / b / a in 0–1, in the document's colour space — how the
+   * overlay is drawn on the canvas, not anything rendered, so get_design_context leaves it out.
+   * Figma's default, which a grid written without one gets, is red at 10%.
+   */
+  color: z.object({ r: z.number(), g: z.number(), b: z.number(), a: z.number() }).optional(),
   /** Per-field bindings — Figma allows `sectionSize`, `count`, `offset` and `gutterSize`. */
   boundVariables: SerializedBindingsSchema.optional(),
 });
 export type SerializedLayoutGrid = z.infer<typeof SerializedLayoutGridSchema>;
+
+/**
+ * A layout grid as get_design_context carries it: without `color`, which is how the editor draws
+ * the overlay and nothing the code renders. Kept out of the schema as well as the output, so
+ * design_diff baselines keep the shape they were captured in.
+ */
+export const DesignContextLayoutGridSchema = SerializedLayoutGridSchema.omit({ color: true });
+export type DesignContextLayoutGrid = z.infer<typeof DesignContextLayoutGridSchema>;
 
 /** One grid track (a row or column) in a GRID auto-layout: FLEX (fr fraction) or FIXED (px). */
 export const SerializedGridTrackSchema = z.object({
@@ -594,6 +608,74 @@ export const SerializedTextPathStartSchema = z.object({
 });
 export type SerializedTextPathStart = z.infer<typeof SerializedTextPathStartSchema>;
 
+/**
+ * A node's 3D transform (beta), as Figma holds it; omitted when there is none. `FIXED_ORDER` is
+ * translateZ (px) → rotateX → rotateY → rotateZ (degrees, CSS signs) about `transformOrigin`, in
+ * the node's own axes. `FREEFORM` is an imported transform whose matrix the plugin API does not
+ * expose. `backfaceVisible: false` → `backface-visibility: hidden`; `visible: false` is a transform
+ * the designer switched off, which Figma does not draw. Both are omitted at their default (true).
+ * The shape round-trips into set_transform_3d.
+ */
+export const SerializedTransform3dSchema = z.discriminatedUnion('type', [
+  z.object({
+    type: z.literal('FIXED_ORDER'),
+    translateZ: z.number(),
+    rotateX: z.number(),
+    rotateY: z.number(),
+    rotateZ: z.number(),
+    backfaceVisible: z.literal(false).optional(),
+    visible: z.literal(false).optional(),
+  }),
+  z.object({
+    type: z.literal('FREEFORM'),
+    backfaceVisible: z.literal(false).optional(),
+    visible: z.literal(false).optional(),
+  }),
+]);
+export type SerializedTransform3d = z.infer<typeof SerializedTransform3dSchema>;
+
+const transformOriginAxisSchema = z.object({
+  unit: z.enum(['PERCENT', 'PIXELS']),
+  value: z.number(),
+});
+
+/**
+ * The point a 3D transform turns about — CSS `transform-origin`. PERCENT is of the node's own width
+ * (x) / height (y); PIXELS is from its top-left. Only beside a transform3d, and only when it is not
+ * the 50% / 50% default.
+ */
+export const SerializedTransformOriginSchema = z.object({
+  x: transformOriginAxisSchema,
+  y: transformOriginAxisSchema,
+});
+export type SerializedTransformOrigin = z.infer<typeof SerializedTransformOriginSchema>;
+
+/**
+ * A frame / component / instance's 3D scene (beta) — what its children's 3D transforms render in.
+ * `perspective` px → CSS `perspective` (below 0 = none, 0…1 draws as 1px); `preserve3d` → CSS
+ * `transform-style: preserve-3d`, under which Figma ignores the container's own opacity, blend
+ * mode, effects and clipping; `visible: false` switches the perspective off (`preserve3d` still
+ * applies). An instance reads its main component's scene unless it overrides it.
+ */
+export const SerializedScene3dSchema = z.object({
+  perspective: z.number(),
+  preserve3d: z.boolean(),
+  visible: z.literal(false).optional(),
+});
+export type SerializedScene3d = z.infer<typeof SerializedScene3dSchema>;
+
+/**
+ * One end of a FigJam connector, as create_connector takes it: `endpointNodeId` + `magnet` attached
+ * to a side of that node, `endpointNodeId` + `position` attached at a point on it (px from its
+ * top-left), or `position` alone, floating (px in the connector's parent's coordinates).
+ */
+export const SerializedConnectorEndpointSchema = z.object({
+  endpointNodeId: z.string().optional(),
+  magnet: z.enum(['NONE', 'AUTO', 'TOP', 'LEFT', 'BOTTOM', 'RIGHT', 'CENTER']).optional(),
+  position: z.object({ x: z.number(), y: z.number() }).optional(),
+});
+export type SerializedConnectorEndpoint = z.infer<typeof SerializedConnectorEndpointSchema>;
+
 /** A box measured from a node's own top-left corner: x / y are offsets (negative = up / left). */
 export const SerializedBoundsSchema = z.object({
   x: z.number(),
@@ -627,6 +709,25 @@ export interface SerializedNode {
    * the room an auto-layout parent gives it.
    */
   boundingBox?: SerializedBounds;
+  /** A 3D transform — see SerializedTransform3dSchema. */
+  transform3d?: SerializedTransform3d;
+  /** Where transform3d turns about, when not the centre — see SerializedTransformOriginSchema. */
+  transformOrigin?: SerializedTransformOrigin;
+  /**
+   * The CSS that draws transform3d: with `transform-origin: 0 0` at the node's x / y, emit
+   * `transform: <cssTransform> <cssTransform3d>` (cssTransform only when present). Only for a
+   * FIXED_ORDER transform that is switched on. On a GROUP, apply it to the group's unturned
+   * wrapper: a turned group's turn is folded in.
+   */
+  cssTransform3d?: string;
+  /** The 3D scene a frame / component / instance gives its children — see SerializedScene3dSchema. */
+  scene3d?: SerializedScene3d;
+  /** A FigJam connector's two ends, its path shape and its end caps. */
+  connectorStart?: SerializedConnectorEndpoint;
+  connectorEnd?: SerializedConnectorEndpoint;
+  connectorLineType?: string;
+  connectorStartStrokeCap?: string;
+  connectorEndStrokeCap?: string;
   opacity?: number;
   cornerRadius?: number | Mixed;
   /** Figma corner smoothing, 0–1 (0 = circular). */
@@ -826,6 +927,15 @@ export const SerializedNodeSchema = z.lazy(() =>
     flipped: z.boolean().optional(),
     cssTransform: z.string().optional(),
     boundingBox: SerializedBoundsSchema.optional(),
+    transform3d: SerializedTransform3dSchema.optional(),
+    transformOrigin: SerializedTransformOriginSchema.optional(),
+    cssTransform3d: z.string().optional(),
+    scene3d: SerializedScene3dSchema.optional(),
+    connectorStart: SerializedConnectorEndpointSchema.optional(),
+    connectorEnd: SerializedConnectorEndpointSchema.optional(),
+    connectorLineType: z.string().optional(),
+    connectorStartStrokeCap: z.string().optional(),
+    connectorEndStrokeCap: z.string().optional(),
     opacity: z.number().optional(),
     cornerRadius: z.union([z.number(), z.literal(MIXED)]).optional(),
     cornerSmoothing: z.number().min(0).max(1).optional(),

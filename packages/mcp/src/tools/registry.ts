@@ -10,6 +10,11 @@ import { addPageTool } from './add-page.js';
 import { addVariableModeTool } from './add-variable-mode.js';
 import { alignNodesTool } from './align-nodes.js';
 import { analyzeProjectTool } from './analyze-project.js';
+import {
+  createAnnotationCategoryTool,
+  deleteAnnotationCategoryTool,
+  updateAnnotationCategoryTool,
+} from './annotation-categories.js';
 import { applyAnimationStyleTool } from './apply-animation-style.js';
 import { applyManualKeyframeTrackTool } from './apply-manual-keyframe-track.js';
 import { applyStyleToNodeTool } from './apply-style-to-node.js';
@@ -23,6 +28,7 @@ import { cloneNodeTool } from './clone-node.js';
 import { combineAsVariantsTool } from './combine-as-variants.js';
 import { componentMapTool } from './component-map.js';
 import { createComponentTool } from './create-component.js';
+import { createConnectorTool } from './create-connector.js';
 import { createEffectStyleTool } from './create-effect-style.js';
 import { createEllipseTool } from './create-ellipse.js';
 import { createFrameTool } from './create-frame.js';
@@ -81,6 +87,11 @@ import { importSvgTool } from './import-svg.js';
 import { importVariableTool } from './import-variable.js';
 import { listFilesTool } from './list-files.js';
 import { lockNodesTool } from './lock-nodes.js';
+import {
+  addMeasurementTool,
+  deleteMeasurementTool,
+  updateMeasurementTool,
+} from './measurements.js';
 import { moveNodesTool } from './move-nodes.js';
 import { navigateToPageTool } from './navigate-to-page.js';
 import { outlineStrokeTool } from './outline-stroke.js';
@@ -102,10 +113,12 @@ import { scanComponentsTool } from './scan-components.js';
 import { scanNodesByTypesTool } from './scan-nodes-by-types.js';
 import { scanTextNodesTool } from './scan-text-nodes.js';
 import { searchNodesTool } from './search-nodes.js';
+import { setAnnotationsTool } from './set-annotations.js';
 import { setArcTool } from './set-arc.js';
 import { setAutoLayoutTool } from './set-auto-layout.js';
 import { setBlendModeTool } from './set-blend-mode.js';
 import { setComplexStrokeTool } from './set-complex-stroke.js';
+import { setComponentDocumentationTool } from './set-component-documentation.js';
 import { setConstraintsTool } from './set-constraints.js';
 import { setCornerRadiusTool } from './set-corner-radius.js';
 import { setEffectsTool } from './set-effects.js';
@@ -126,6 +139,7 @@ import { setTextPropertiesTool } from './set-text-properties.js';
 import { setTextRangeTool } from './set-text-range.js';
 import { setTextTool } from './set-text.js';
 import { setTimelineDurationTool } from './set-timeline-duration.js';
+import { setTransform3dTool } from './set-transform-3d.js';
 import { setVariableCodeSyntaxTool } from './set-variable-code-syntax.js';
 import { setVariableValueTool } from './set-variable-value.js';
 import { setVectorTool } from './set-vector.js';
@@ -137,9 +151,11 @@ import { ungroupNodesTool } from './ungroup-nodes.js';
 import { unlockNodesTool } from './unlock-nodes.js';
 import { updateEffectStyleTool } from './update-effect-style.js';
 import { updateFlowsTool } from './update-flows.js';
+import { updateGridStyleTool } from './update-grid-style.js';
 import { updatePaintStyleTool } from './update-paint-style.js';
 import { updateTextStyleTool } from './update-text-style.js';
 import { updateVariableCollectionTool } from './update-variable-collection.js';
+import { updateVariableTool } from './update-variable.js';
 import { useFileTool } from './use-file.js';
 
 /**
@@ -212,6 +228,7 @@ const DECLARED_TOOL_SPECS: readonly ToolSpec[] = [
   setRepeatTool,
   createTextPathTool,
   setTextPathTool,
+  setTransform3dTool,
   setComplexStrokeTool,
   // Vector geometry
   createVectorTool,
@@ -239,6 +256,7 @@ const DECLARED_TOOL_SPECS: readonly ToolSpec[] = [
   updatePaintStyleTool,
   updateTextStyleTool,
   updateEffectStyleTool,
+  updateGridStyleTool,
   applyStyleToNodeTool,
   importStyleTool,
   deleteStyleTool,
@@ -252,6 +270,14 @@ const DECLARED_TOOL_SPECS: readonly ToolSpec[] = [
   importVariableTool,
   setNodeVariableModeTool,
   renameVariableTool,
+  updateVariableTool,
+  setAnnotationsTool,
+  createAnnotationCategoryTool,
+  updateAnnotationCategoryTool,
+  deleteAnnotationCategoryTool,
+  addMeasurementTool,
+  updateMeasurementTool,
+  deleteMeasurementTool,
   setVariableCodeSyntaxTool,
   deleteVariableTool,
   deleteVariableModeTool,
@@ -282,8 +308,10 @@ const DECLARED_TOOL_SPECS: readonly ToolSpec[] = [
   createEllipseTool,
   createComponentTool,
   createSectionTool,
+  createConnectorTool,
   createInstanceTool,
   combineAsVariantsTool,
+  setComponentDocumentationTool,
   // Motion (beta) — Figma Design only
   applyAnimationStyleTool,
   removeAnimationStyleTool,

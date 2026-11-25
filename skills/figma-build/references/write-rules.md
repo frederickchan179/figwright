@@ -230,6 +230,59 @@ is `flip_nodes` with `axis: 'HORIZONTAL'` or `'VERTICAL'`: it flips each node in
 centre and reads back as `flipped: true`. Do not fake it with `rotate_nodes` 180 — that turns the
 node upside down instead of mirroring it.
 
+### 3D: `set_transform_3d` (beta)
+
+A card flipped in depth, a tilted panel, a cube face — CSS `rotateX()` / `rotateY()` /
+`translateZ()` — is `set_transform_3d` on the element, and the `perspective` /
+`transform-style: preserve-3d` of its container is that container's `scene3d`. These are the same
+fields `get_design_context` reads (and its `cssTransform3d` is how they read back as CSS).
+
+- `transform3d` is applied in one fixed order, CSS `translateZ → rotateX → rotateY → rotateZ`,
+  about `transformOrigin` (CSS `transform-origin`, px or %; centre by default), in the layer's own
+  axes. A CSS transform in that order maps number for number; another order, or a `matrix3d()`,
+  has no exact equivalent — the plugin API cannot make any other kind — so say so and check with
+  `get_screenshot`. A flat turn (`rotate()`) is still `rotate_nodes`: `rotateZ` here turns the
+  layer after its 3D turn and leaves its box alone.
+- `backface-visibility: hidden` is `backfaceVisible: false`.
+- Perspective lives on the container, not in a layer's own transform: `scene3d: { perspective }`
+  on the frame (or component, instance) the turned layers sit in, plus `preserve3d: true` when they
+  should share one 3D space and sort by depth (CSS `transform-style: preserve-3d`). A layer deeper
+  down only shares it through containers that are `preserve3d` too.
+- Under `preserve3d`, Figma ignores that container's own opacity, blend mode, effects and
+  clipping. Put them on a flat frame around it.
+- Nothing moves: the box, `x` / `y` and an auto-layout's spacing stay as they were, as in CSS.
+- Each call merges with what the layer holds, so `{ rotateY: 30 }` keeps the other numbers.
+  `{ type: 'NONE' }` removes the transform and its 3D keyframe tracks (the result names them;
+  inside a `batch` it is refused for a layer with such tracks).
+- Animating it: `apply_manual_keyframe_track` with `TRANSFORM_3D_ROTATION_X` / `Y` / `Z`
+  (degrees), `TRANSFORM_3D_TRANSLATION_Z` (px) or `SCENE_3D_PERSPECTIVE` (px, ≥ 0, on the
+  container). A track's `baseValue` is the static value itself, so set it to what the layer rests
+  at, or leave it out to keep the current one.
+- FigJam turns rectangles, ellipses, frames and text too; stickies, shapes with text, sections and
+  connectors take no 3D.
+
+### FigJam boards: connectors and the words on stickies
+
+A flowchart or a diagram on a FigJam board is its boxes joined by connectors. Frames, sections,
+rectangles, ellipses and text are made as anywhere else; join them with `create_connector`.
+
+- Each end is `{ endpointNodeId, magnet? }` (a side: TOP / BOTTOM / LEFT / RIGHT / CENTER, or AUTO,
+  the nearest), `{ endpointNodeId, position }` (a point on the node, in px from its top-left — its
+  right-middle is `{ x: width, y: height / 2 }`), or `{ position }` (a free end, in px in the
+  connector's parent's coordinates). An attached end follows its node, and **removing a node removes
+  the connectors attached to it**. Leave `parentId` out: Figma puts the connector in the section (or
+  frame) its two nodes share, as its own connector tool does, so it reads and diffs with them.
+- In a `batch`, `endpointNodeId: "$N"` attaches to the node an earlier op made, so a whole chart —
+  boxes, then the connectors between them — is one call.
+- Defaults are FigJam's own: ELBOWED, an ARROW_LINES end, weight 4. `text` labels the connector in
+  FigJam's caption face (Inter Medium), and the layer takes the label as its name.
+- The words on a sticky, a shape with text, a table cell or a connector are rewritten with
+  `set_text` on the node's own id (the text sublayer inside has none a tool can use); the runs the
+  old and new words share keep their styling, as on any text. `scan_text_nodes` and `get_node`
+  read them. The other text tools (`set_text_properties`, `set_text_range`, `find_replace_text`)
+  do not reach them.
+- Connectors exist only in FigJam: in a Figma Design file, draw an arrow with `create_vector`.
+
 ### Figma Draw: vectors, repeats, text on a path, brushes, patterns
 
 These write the same fields `get_design_context` reads, so a design built with them reads back

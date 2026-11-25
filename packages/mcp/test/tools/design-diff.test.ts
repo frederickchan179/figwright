@@ -236,6 +236,155 @@ describe('handleDesignDiff', () => {
       },
     );
 
+    // Up to v11 nothing 3D was captured: a node turned in depth, or a scene, is not a change.
+    const withDepth = (rotateY: number): GetDesignContextResult => {
+      const context = withStyles({});
+      const card = context.nodes[0]!;
+      card.scene3d = { perspective: 800, preserve3d: true };
+      const title = card.children![0]!;
+      title.transform3d = { type: 'FIXED_ORDER', translateZ: 0, rotateX: 0, rotateY, rotateZ: 0 };
+      title.transformOrigin = {
+        x: { unit: 'PIXELS', value: 0 },
+        y: { unit: 'PERCENT', value: 50 },
+      };
+      title.cssTransform3d = `translate(0px, 50%) rotateY(${rotateY}deg)`;
+      return context;
+    };
+    it.each([9, 10, 11])(
+      'v%i sees a 3D transform and a scene it could not hold as no change',
+      async version => {
+        await writeAt(version, withStyles({}));
+        currentCtx = withDepth(30);
+        const r = await diff();
+        expect(r.status).toBe('no-changes');
+        expect(r.baselineCapturedAt).toBe(`v${version}`);
+      },
+    );
+
+    it('a current baseline sees a 3D turn change', async () => {
+      await writeAt(SNAPSHOT_FORMAT_VERSION, withDepth(30));
+      currentCtx = withDepth(45);
+      const r = await diff();
+      expect(r.status).toBe('diff');
+      expect(changedFields(r)?.map(([field]) => field)).toEqual(['cssTransform3d', 'transform3d']);
+    });
+
+    // The plugin sends the 3D fields whatever the server's format number, so an older server
+    // working with a newer plugin saves them in an older-format baseline.
+    it.each([9, 10, 11])(
+      'v%i captured through a newer plugin diffs the 3D it holds: unchanged, then changed',
+      async version => {
+        await writeAt(version, withDepth(30));
+        currentCtx = withDepth(30);
+        expect((await diff()).status).toBe('no-changes');
+        currentCtx = withDepth(45);
+        const r = await diff();
+        expect(r.status).toBe('diff');
+        expect(changedFields(r)?.map(([field]) => field)).toEqual([
+          'cssTransform3d',
+          'transform3d',
+        ]);
+      },
+    );
+
+    it('v11 captured through a newer plugin, holding only a scene, sees it as no change', async () => {
+      const sceneOnly = (): GetDesignContextResult => {
+        const context = withStyles({});
+        context.nodes[0]!.scene3d = { perspective: 800, preserve3d: true };
+        return context;
+      };
+      await writeAt(11, sceneOnly());
+      currentCtx = sceneOnly();
+      expect((await diff()).status).toBe('no-changes');
+    });
+
+    // Up to v12 a FigJam caption's words were not read, nor a connector's ends: a board read with
+    // them is not a change (measured live: a v12 baseline of an untouched board reported every
+    // sticky and shape as changed).
+    const withFigJam = (words: string, to = '1:2'): GetDesignContextResult => {
+      const context = withStyles({});
+      const card = context.nodes[0]!;
+      card.children = [
+        ...card.children!,
+        { id: '1:3', name: 'Note', type: 'STICKY', characters: words },
+        {
+          id: '1:4',
+          name: 'Connector line',
+          type: 'CONNECTOR',
+          characters: '',
+          connectorStart: { endpointNodeId: '1:3', magnet: 'AUTO' },
+          connectorEnd: { endpointNodeId: to, magnet: 'AUTO' },
+          connectorLineType: 'ELBOWED',
+          connectorStartStrokeCap: 'NONE',
+          connectorEndStrokeCap: 'ARROW_LINES',
+        },
+      ];
+      return context;
+    };
+    const withoutFigJamFields = (): GetDesignContextResult => {
+      const context = withStyles({});
+      const card = context.nodes[0]!;
+      card.children = [
+        ...card.children!,
+        { id: '1:3', name: 'Note', type: 'STICKY' },
+        { id: '1:4', name: 'Connector line', type: 'CONNECTOR' },
+      ];
+      return context;
+    };
+    it.each([9, 10, 11, 12])(
+      'v%i sees a caption and a connector’s ends it could not hold as no change',
+      async version => {
+        await writeAt(version, withoutFigJamFields());
+        currentCtx = withFigJam('Ship it');
+        const r = await diff();
+        expect(r.status).toBe('no-changes');
+        expect(r.baselineCapturedAt).toBe(`v${version}`);
+      },
+    );
+
+    it('keeps a TEXT node’s words in the compare against a v12 baseline — those were always read', async () => {
+      await writeAt(12, withoutFigJamFields());
+      currentCtx = (() => {
+        const context = withFigJam('Ship it');
+        context.nodes[0]!.children![0]!.characters = 'Bye';
+        return context;
+      })();
+      const r = await diff();
+      expect(r.status).toBe('diff');
+      expect(changedFields(r)).toEqual([['characters', 'Bye']]);
+    });
+
+    it('a current baseline sees a sticky reworded and a connector re-routed', async () => {
+      await writeAt(SNAPSHOT_FORMAT_VERSION, withFigJam('Ship it'));
+      currentCtx = withFigJam('Ship it today', '1:1');
+      const r = await diff();
+      expect(r.status).toBe('diff');
+      expect(changedFields(r)?.map(([field]) => field)).toEqual(['characters', 'connectorEnd']);
+    });
+
+    it.each([9, 10, 11, 12])(
+      'v%i captured through a newer plugin diffs the captions and ends it holds',
+      async version => {
+        await writeAt(version, withFigJam('Ship it'));
+        currentCtx = withFigJam('Ship it');
+        expect((await diff()).status).toBe('no-changes');
+        currentCtx = withFigJam('Ship it today');
+        const r = await diff();
+        expect(r.status).toBe('diff');
+        expect(changedFields(r)).toEqual([['characters', 'Ship it today']]);
+      },
+    );
+
+    it('v11 cuts both what 3D and what v13 added from a capture holding both', async () => {
+      await writeAt(11, withoutFigJamFields());
+      currentCtx = (() => {
+        const context = withFigJam('Ship it');
+        context.nodes[0]!.scene3d = { perspective: 800, preserve3d: true };
+        return context;
+      })();
+      expect((await diff()).status).toBe('no-changes');
+    });
+
     it('v9 reports every other change, other style slots included', async () => {
       await writeAt(9, withStyles({ fill: 'S:a' }));
       currentCtx = withStyles({ fill: 'S:b,', grid: 'S:grid,' }, { title: 'Bye' });

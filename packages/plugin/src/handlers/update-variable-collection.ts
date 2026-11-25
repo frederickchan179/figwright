@@ -50,6 +50,20 @@ const parseModes = (raw: unknown, collection: VariableCollection): ModeRename[] 
 };
 
 /**
+ * Rename a collection without the side effect Figma attaches to the write: setting
+ * `collection.name` — even to the name it already has — resets `hiddenFromPublishing` to true
+ * (measured 2026-11-20; no other collection or variable write touches it). Renaming through
+ * Figwright used to take a published collection out of the library without a word. The flag is put
+ * back as it was, and a name the collection already has is not written at all.
+ */
+export const renameCollection = (collection: VariableCollection, name: string): void => {
+  if (collection.name === name) return;
+  const hidden = collection.hiddenFromPublishing;
+  collection.name = name;
+  if (collection.hiddenFromPublishing !== hidden) collection.hiddenFromPublishing = hidden;
+};
+
+/**
  * Rename a variable collection and/or its modes.
  *
  * Renaming changes no id, which is the whole point: a mis-named collection can be corrected in
@@ -64,12 +78,20 @@ const parseModes = (raw: unknown, collection: VariableCollection): ModeRename[] 
 export const createUpdateVariableCollectionHandler =
   (figmaCtx: typeof figma): SandboxToolHandler =>
   async params => {
-    const p = (params ?? {}) as { collectionId?: unknown; name?: unknown; modes?: unknown };
+    const p = (params ?? {}) as {
+      collectionId?: unknown;
+      name?: unknown;
+      modes?: unknown;
+      hiddenFromPublishing?: unknown;
+    };
     if (typeof p.collectionId !== 'string') {
       throw new TypeError('update_variable_collection: collectionId must be a string');
     }
     if (p.name !== undefined && (typeof p.name !== 'string' || p.name.length === 0)) {
       throw new TypeError('update_variable_collection: name must be a non-empty string');
+    }
+    if (p.hiddenFromPublishing !== undefined && typeof p.hiddenFromPublishing !== 'boolean') {
+      throw new TypeError('update_variable_collection: hiddenFromPublishing must be a boolean');
     }
 
     const collection = await figmaCtx.variables.getVariableCollectionByIdAsync(p.collectionId);
@@ -79,8 +101,15 @@ export const createUpdateVariableCollectionHandler =
 
     const renames = parseModes(p.modes, collection);
 
-    if (typeof p.name === 'string') collection.name = p.name;
+    if (typeof p.name === 'string') renameCollection(collection, p.name);
     for (const rename of renames) collection.renameMode(rename.modeId, rename.name);
+    // Last: Figma refuses it on no content (measured), so nothing before it is left for it to undo.
+    if (
+      typeof p.hiddenFromPublishing === 'boolean' &&
+      collection.hiddenFromPublishing !== p.hiddenFromPublishing
+    ) {
+      collection.hiddenFromPublishing = p.hiddenFromPublishing;
+    }
 
     const result: UpdateCollectionResult = {
       ok: true,
@@ -88,5 +117,8 @@ export const createUpdateVariableCollectionHandler =
       name: collection.name,
       modes: collection.modes.map(mode => ({ modeId: mode.modeId, name: mode.name })),
     };
+    if (typeof p.hiddenFromPublishing === 'boolean') {
+      result.hiddenFromPublishing = collection.hiddenFromPublishing;
+    }
     return result;
   };

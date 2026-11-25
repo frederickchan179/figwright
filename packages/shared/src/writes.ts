@@ -1,6 +1,13 @@
 import { z } from 'zod';
 
-import { FlowStartingPointSchema } from './serialized-node.js';
+import { SerializedMeasurementSchema } from './queries.js';
+import {
+  FlowStartingPointSchema,
+  SerializedAnnotationSchema,
+  SerializedScene3dSchema,
+  SerializedTransform3dSchema,
+  SerializedTransformOriginSchema,
+} from './serialized-node.js';
 
 // Write tools carry a server-generated requestId so the plugin can dedupe retries (idempotency).
 // Inputs are validated per-tool in the plugin handlers; this module holds the shared result shapes.
@@ -37,6 +44,50 @@ export const LayoutPropsResultSchema = MutateResultSchema.extend({
   adjusted: z.string().optional(),
 });
 export type LayoutPropsResult = z.infer<typeof LayoutPropsResultSchema>;
+
+/**
+ * Result of set_layout_grids. A grid colour Figma would refuse is left out — the grid gets the
+ * default — rather than failing every grid with it; `adjusted` names each. Absent when none was.
+ */
+export const LayoutGridsResultSchema = MutateResultSchema.extend({
+  adjusted: z.string().optional(),
+});
+export type LayoutGridsResult = z.infer<typeof LayoutGridsResultSchema>;
+
+/**
+ * Result of set_component_documentation. Figma stores a description in its own form — surrounding
+ * whitespace trimmed, line breaks as `\n`, everything from a NUL dropped, markdown rewritten — and
+ * `adjusted` says which of those happened to this call. Absent when everything landed as sent.
+ */
+export const ComponentDocumentationResultSchema = MutateResultSchema.extend({
+  adjusted: z.string().optional(),
+});
+export type ComponentDocumentationResult = z.infer<typeof ComponentDocumentationResultSchema>;
+
+/**
+ * Result of set_transform_3d: the node's 3D fields read back as get_node reads them — each absent
+ * when there is none (no transform, a centred origin, no scene). `adjusted` names what changed
+ * beyond the call (keyframe tracks removed with the transform) or did not stick (a scene with no
+ * perspective and no shared space, which is none).
+ */
+export const Transform3dWriteResultSchema = MutateResultSchema.extend({
+  transform3d: SerializedTransform3dSchema.optional(),
+  transformOrigin: SerializedTransformOriginSchema.optional(),
+  cssTransform3d: z.string().optional(),
+  scene3d: SerializedScene3dSchema.optional(),
+  adjusted: z.string().optional(),
+});
+export type Transform3dWriteResult = z.infer<typeof Transform3dWriteResultSchema>;
+
+/**
+ * Result of apply_manual_keyframe_track. A 3D track can change the node beyond the track — give a
+ * node with no 3D transform one, give a frame a scene, or rewrite the static value its baseValue is
+ * — and `adjusted` says which. Absent for every other track, and when nothing else changed.
+ */
+export const KeyframeTrackResultSchema = MutateResultSchema.extend({
+  adjusted: z.string().optional(),
+});
+export type KeyframeTrackResult = z.infer<typeof KeyframeTrackResultSchema>;
 
 /**
  * Result of apply_animation_style: echoes the applied-style instance id Figma returns from
@@ -119,6 +170,8 @@ export const StyleResultSchema = z.object({
   ok: z.literal(true),
   styleId: z.string(),
   name: z.string(),
+  /** What did not land as sent — a grid style's colour Figma would refuse. Absent when all did. */
+  adjusted: z.string().optional(),
 });
 export type StyleResult = z.infer<typeof StyleResultSchema>;
 
@@ -128,6 +181,8 @@ export const CollectionResultSchema = z.object({
   collectionId: z.string(),
   defaultModeId: z.string(),
   name: z.string(),
+  /** Whether the new collection is left out of the published library (create_variable_collection). */
+  hiddenFromPublishing: z.boolean().optional(),
 });
 export type CollectionResult = z.infer<typeof CollectionResultSchema>;
 
@@ -158,6 +213,8 @@ export const UpdateCollectionResultSchema = z.object({
   collectionId: z.string(),
   name: z.string(),
   modes: z.array(z.object({ modeId: z.string(), name: z.string() })),
+  /** The collection's publishing flag as it now stands — present when the call set it. */
+  hiddenFromPublishing: z.boolean().optional(),
 });
 export type UpdateCollectionResult = z.infer<typeof UpdateCollectionResultSchema>;
 
@@ -193,6 +250,8 @@ export const VariableResultSchema = z.object({
   name: z.string(),
   /** The per-platform declarations now in effect (set_variable_code_syntax echoes them back). */
   codeSyntax: z.record(z.string(), z.string()).optional(),
+  /** What Figma stored differently from what was sent (a trimmed description, …). */
+  adjusted: z.string().optional(),
 });
 export type VariableResult = z.infer<typeof VariableResultSchema>;
 
@@ -236,3 +295,49 @@ export const BatchResultSchema = z.object({
   results: z.array(z.unknown()),
 });
 export type BatchResult = z.infer<typeof BatchResultSchema>;
+
+/** Result of set_annotations: the node's annotations as Figma now holds them. */
+export const AnnotationsResultSchema = z.object({
+  ok: z.literal(true),
+  nodeId: z.string(),
+  annotations: z.array(SerializedAnnotationSchema),
+  /** What Figma stored differently from what was sent (a trimmed label, rewritten markdown). */
+  adjusted: z.string().optional(),
+});
+export type AnnotationsResult = z.infer<typeof AnnotationsResultSchema>;
+
+/** Result of create_annotation_category / update_annotation_category. */
+export const AnnotationCategoryResultSchema = z.object({
+  ok: z.literal(true),
+  categoryId: z.string(),
+  label: z.string(),
+  color: z.string(),
+  isPreset: z.boolean(),
+});
+export type AnnotationCategoryResult = z.infer<typeof AnnotationCategoryResultSchema>;
+
+/** Result of delete_annotation_category. */
+export const DeleteAnnotationCategoryResultSchema = z.object({
+  ok: z.literal(true),
+  categoryId: z.string(),
+  label: z.string(),
+});
+export type DeleteAnnotationCategoryResult = z.infer<typeof DeleteAnnotationCategoryResultSchema>;
+
+/** Result of add_measurement / update_measurement: the measurement as Figma now holds it. */
+export const MeasurementResultSchema = SerializedMeasurementSchema.omit({ id: true }).extend({
+  ok: z.literal(true),
+  /** The measurement's id — what update_measurement and delete_measurement take. */
+  measurementId: z.string(),
+  /** The page it lives on. */
+  pageId: z.string(),
+});
+export type MeasurementResult = z.infer<typeof MeasurementResultSchema>;
+
+/** Result of delete_measurement. */
+export const DeleteMeasurementResultSchema = z.object({
+  ok: z.literal(true),
+  measurementId: z.string(),
+  pageId: z.string(),
+});
+export type DeleteMeasurementResult = z.infer<typeof DeleteMeasurementResultSchema>;

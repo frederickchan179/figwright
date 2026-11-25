@@ -61,6 +61,11 @@ const NODE_FIELDS = new Set([
   'instanceId',
   'fromNodeId',
   'sourceNodeId',
+  // add_measurement's two ends.
+  'startNodeId',
+  'endNodeId',
+  // create_connector's two ends: the node each attaches to.
+  'endpointNodeId',
   'destinationId',
   // add_page answers with the page's `nodeId` — a page is a node.
   'pageId',

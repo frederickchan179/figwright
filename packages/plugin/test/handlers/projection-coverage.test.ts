@@ -75,6 +75,18 @@ const frameInGrid = base({
     [Math.SQRT1_2, -Math.SQRT1_2, 0],
     [-Math.SQRT1_2, -Math.SQRT1_2, 0],
   ],
+  // Turned in depth about its left edge, inside a scene of its own.
+  transform3d: {
+    type: 'FIXED_ORDER',
+    translateZ: 10,
+    rotateX: 0,
+    rotateY: 30,
+    rotateZ: 0,
+    backfaceVisible: false,
+    visible: true,
+  },
+  transformOrigin: { x: { unit: 'PIXELS', value: 0 }, y: { unit: 'PERCENT', value: 50 } },
+  scene3d: { perspective: 800, preserve3d: true, visible: true },
   opacity: 0.5,
   cornerRadius: Symbol('mixed'),
   cornerSmoothing: 0.6,
@@ -282,8 +294,21 @@ Object.defineProperty(brokenSetInstance, 'componentProperties', {
   },
 });
 
+// A FigJam connector: its ends, path shape, caps — and its label, read off its text sublayer.
+const connector = base({
+  id: 'h',
+  type: 'CONNECTOR',
+  connectorStart: { endpointNodeId: '1:1', magnet: 'AUTO' },
+  connectorEnd: { endpointNodeId: '1:2', position: { x: 0, y: 40 } },
+  connectorLineType: 'ELBOWED',
+  connectorStartStrokeCap: 'NONE',
+  connectorEndStrokeCap: 'ARROW_LINES',
+  text: { characters: 'flows to' },
+});
+
 const FIXTURES = [
   frameInGrid,
+  connector,
   arcWithConstraints,
   richText,
   drawnStroke,

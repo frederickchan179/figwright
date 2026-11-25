@@ -10,19 +10,23 @@ describe('editorLimitation', () => {
   // The manifest claims three editors; two of them can't do what the tool surface assumes.
   it('describes what Dev Mode and FigJam refuse', () => {
     expect(editorLimitation('dev')).toContain('blocks every write');
+    // Annotations are the writes Dev Mode allows (with a style's description), measured.
+    expect(editorLimitation('dev')).toContain(
+      "except annotations, measurements and a style's description",
+    );
     expect(editorLimitation('figjam')).toContain(
-      'no components, variables, styles or Figma Motion',
+      'no components, variables, styles, annotations or Figma Motion',
     );
   });
 
-  // Verified live in FigJam: createFrame / createSection / createRectangle / createText all
-  // succeed. An earlier wording claimed FigJam had no frames, which would have sent an agent
-  // looking for a workaround it never needed.
+  // Verified live in FigJam: createFrame / createSection / createRectangle / createText /
+  // createConnector all succeed. An earlier wording claimed FigJam had no frames, which would have
+  // sent an agent looking for a workaround it never needed.
   it('does not claim FigJam lacks what it actually has', () => {
     const figjam = editorLimitation('figjam') ?? '';
 
     expect(figjam).not.toContain('no frames');
-    expect(figjam).toContain('frames, sections, shapes and text all work');
+    expect(figjam).toContain('frames, sections, shapes, text and connectors all work');
   });
 
   // Verified live in Dev Mode: createFrame, createPage, createVariableCollection and

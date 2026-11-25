@@ -14,17 +14,22 @@ import {
   SerializedFontNameSchema,
   SerializedGridChildSchema,
   SerializedHyperlinkSchema,
-  SerializedLayoutGridSchema,
+  DesignContextLayoutGridSchema,
   SerializedLetterSpacingSchema,
   SerializedLineHeightSchema,
   SerializedMainComponentSchema,
   SerializedPaintSchema,
+  SerializedConnectorEndpointSchema,
+  SerializedScene3dSchema,
   SerializedStyleIdsSchema,
   SerializedTextPathStartSchema,
+  SerializedTransform3dSchema,
   SerializedTransformModifierSchema,
+  SerializedTransformOriginSchema,
   SerializedVariableWidthStrokeSchema,
 } from './serialized-node.js';
 import type {
+  DesignContextLayoutGrid,
   SerializedAnnotation,
   SerializedAutoLayout,
   SerializedBounds,
@@ -34,10 +39,13 @@ import type {
   SerializedEffect,
   SerializedGridChild,
   SerializedHyperlink,
-  SerializedLayoutGrid,
   SerializedLetterSpacing,
   SerializedLineHeight,
   SerializedMainComponent,
+  SerializedConnectorEndpoint,
+  SerializedScene3d,
+  SerializedTransform3d,
+  SerializedTransformOrigin,
   SerializedPaint,
   SerializedStyleIds,
   SerializedTextPathStart,
@@ -121,6 +129,22 @@ export interface DesignContextNode {
   cssTransform?: string;
   /** With cssTransform: the turned box's bounding box, as offsets from x / y. */
   boundingBox?: SerializedBounds;
+  /** A 3D transform (beta), as Figma holds it; omitted when there is none. */
+  transform3d?: SerializedTransform3d;
+  /** Where transform3d turns about, when not the centre. */
+  transformOrigin?: SerializedTransformOrigin;
+  /**
+   * CSS drawing transform3d: with transform-origin 0 0 at x / y, `transform: <cssTransform>
+   * <cssTransform3d>`. On a GROUP, applied to its unturned wrapper.
+   */
+  cssTransform3d?: string;
+  /** A container's 3D scene (beta): perspective and preserve-3d. */
+  scene3d?: SerializedScene3d;
+  connectorStart?: SerializedConnectorEndpoint;
+  connectorEnd?: SerializedConnectorEndpoint;
+  connectorLineType?: string;
+  connectorStartStrokeCap?: string;
+  connectorEndStrokeCap?: string;
   opacity?: number;
   cornerRadius?: number | typeof MIXED;
   /** Figma corner smoothing, 0–1; omitted when 0 (circular). */
@@ -195,7 +219,7 @@ export interface DesignContextNode {
    * infers; present only on frames that define grids. Distinct from `layout` (auto-layout of
    * children).
    */
-  layoutGrids?: readonly SerializedLayoutGrid[];
+  layoutGrids?: readonly DesignContextLayoutGrid[];
   /**
    * Scroll behaviour of a clipping frame (HORIZONTAL / VERTICAL / BOTH) → overflow; omitted when
    * NONE.
@@ -382,6 +406,15 @@ export const DesignContextNodeSchema = z.lazy(() =>
     flipped: z.boolean().optional(),
     cssTransform: z.string().optional(),
     boundingBox: SerializedBoundsSchema.optional(),
+    transform3d: SerializedTransform3dSchema.optional(),
+    transformOrigin: SerializedTransformOriginSchema.optional(),
+    cssTransform3d: z.string().optional(),
+    scene3d: SerializedScene3dSchema.optional(),
+    connectorStart: SerializedConnectorEndpointSchema.optional(),
+    connectorEnd: SerializedConnectorEndpointSchema.optional(),
+    connectorLineType: z.string().optional(),
+    connectorStartStrokeCap: z.string().optional(),
+    connectorEndStrokeCap: z.string().optional(),
     opacity: z.number().optional(),
     cornerRadius: z.union([z.number(), z.literal(MIXED)]).optional(),
     cornerSmoothing: z.number().min(0).max(1).optional(),
@@ -430,7 +463,7 @@ export const DesignContextNodeSchema = z.lazy(() =>
     gridChild: SerializedGridChildSchema.optional(),
     constraints: SerializedConstraintsSchema.optional(),
     clipsContent: z.boolean().optional(),
-    layoutGrids: z.array(SerializedLayoutGridSchema).optional(),
+    layoutGrids: z.array(DesignContextLayoutGridSchema).optional(),
     overflowDirection: z.string().optional(),
     numberOfFixedChildren: z.number().optional(),
     targetAspectRatio: z.object({ x: z.number(), y: z.number() }).optional(),
@@ -671,6 +704,16 @@ export const LAYOUT_FIELDS = [
   'flipped',
   'cssTransform',
   'boundingBox',
+  // Which way it faces in depth, and the scene it is seen in: tiny, present only on 3D nodes, and
+  // without them a card drawn turned in perspective comes out flat.
+  'transform3d',
+  'transformOrigin',
+  'cssTransform3d',
+  'scene3d',
+  // Which two nodes a FigJam connector joins, and where on each: the diagram's structure — without
+  // them a flowchart reads as boxes and loose lines.
+  'connectorStart',
+  'connectorEnd',
 ] as const satisfies readonly (keyof DesignContextNode)[];
 
 /**

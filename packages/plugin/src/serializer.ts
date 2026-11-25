@@ -22,6 +22,7 @@ import {
   TOOL_RESULT_LIMIT_BYTES,
 } from '@figwright/shared';
 
+import { readConnector } from './connector.js';
 import { TimeSlice } from './cooperative.js';
 import {
   applyRepeat,
@@ -32,8 +33,10 @@ import {
 } from './draw.js';
 import { cssAngleFromGradientTransform } from './gradient-angle.js';
 import { readGridTrackSizes } from './grid-tracks.js';
+import { textHostOf } from './handlers/text-sublayer.js';
 import { boundingBoxOf, orientationOf } from './orientation.js';
 import { cssProgressiveBlurLayers } from './progressive-blur.js';
+import { readScene3d, readTransform3d } from './transform3d.js';
 import { flattenForest } from './traverse.js';
 
 const isGradient = (paint: Paint): paint is GradientPaint =>
@@ -643,6 +646,13 @@ const enrichWithMixins = (
       out.boundingBox = boundingBoxOf(transform, node.width, node.height);
     }
   }
+  const t3d = readTransform3d(node);
+  if (t3d.transform3d !== undefined) out.transform3d = t3d.transform3d;
+  if (t3d.transformOrigin !== undefined) out.transformOrigin = t3d.transformOrigin;
+  if (t3d.cssTransform3d !== undefined) out.cssTransform3d = t3d.cssTransform3d;
+  const scene3d = readScene3d(node);
+  if (scene3d !== undefined) out.scene3d = scene3d;
+  if (node.type === 'CONNECTOR') Object.assign(out, readConnector(node));
   if ('opacity' in node) {
     const opacity = node.opacity;
     if (typeof opacity === 'number') out.opacity = opacity;
@@ -995,6 +1005,11 @@ const enrichWithMixins = (
     if (needsSegments && typeof text.getStyledTextSegments === 'function') {
       out.segments = serializeTextSegments(text);
     }
+  } else {
+    // A FigJam sticky, shape with text, table cell or connector keeps its words in a sublayer no
+    // tool can address (text-sublayer.ts): they are read off the container, characters only.
+    const host = textHostOf(node);
+    if (host !== null) out.characters = host.characters;
   }
 
   return out;
@@ -1439,11 +1454,16 @@ export const serializeCodeSyntax = (raw: unknown): Record<string, string> | unde
 export const serializeLayoutGrid = (grid: LayoutGrid): SerializedLayoutGrid => {
   // sectionSize / count / offset / gutterSize can each be variable-bound, on the grid object.
   const bound = collectBindings((grid as { boundVariables?: unknown }).boundVariables);
+  // The overlay's colour, so a grid read here writes back as it was: set_layout_grids and the grid
+  // styles used to drop it, and every write reset it to Figma's red at 10%. Copied as Figma holds
+  // it, like a paint's colour (document space, no rounding), and absent only where Figma gives none.
+  const color = gridColor(grid);
   if (grid.pattern === 'GRID') {
     return {
       pattern: 'GRID',
       visible: grid.visible ?? true,
       sectionSize: grid.sectionSize,
+      ...(color === undefined ? {} : { color }),
       ...(bound === undefined ? {} : { boundVariables: bound }),
     };
   }
@@ -1460,8 +1480,26 @@ export const serializeLayoutGrid = (grid: LayoutGrid): SerializedLayoutGrid => {
   if (typeof grid.offset === 'number' && grid.offset !== 0 && grid.alignment !== 'CENTER') {
     out.offset = grid.offset;
   }
+  if (color !== undefined) out.color = color;
   // Last, so a bound grid reads as "the grid, then what it binds" — the order every other
   // serializer here emits.
   if (bound !== undefined) out.boundVariables = bound;
   return out;
+};
+
+/** A layout grid's colour as plain RGBA, or undefined when the object carries none. */
+const gridColor = (
+  grid: LayoutGrid,
+): { r: number; g: number; b: number; a: number } | undefined => {
+  const c = (grid as { color?: Partial<RGBA> }).color;
+  if (
+    c === undefined ||
+    typeof c.r !== 'number' ||
+    typeof c.g !== 'number' ||
+    typeof c.b !== 'number' ||
+    typeof c.a !== 'number'
+  ) {
+    return undefined;
+  }
+  return { r: c.r, g: c.g, b: c.b, a: c.a };
 };

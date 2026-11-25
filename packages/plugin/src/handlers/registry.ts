@@ -1,4 +1,4 @@
-import { markWriteHandler, type SandboxHandlers } from '../dispatcher.js';
+import { markDevModeWrite, markWriteHandler, type SandboxHandlers } from '../dispatcher.js';
 import { createIdempotencyCache, idempotent } from '../idempotency.js';
 import { withInstanceIdLookup } from '../node-lookup.js';
 import { createUndoSteps } from '../undo-steps.js';
@@ -6,6 +6,11 @@ import { createAddComponentPropertyHandler } from './add-component-property.js';
 import { createAddPageHandler } from './add-page.js';
 import { createAddVariableModeHandler } from './add-variable-mode.js';
 import { createAlignNodesHandler } from './align-nodes.js';
+import {
+  createCreateAnnotationCategoryHandler,
+  createDeleteAnnotationCategoryHandler,
+  createUpdateAnnotationCategoryHandler,
+} from './annotation-categories.js';
 import { createApplyAnimationStyleHandler } from './apply-animation-style.js';
 import { createApplyManualKeyframeTrackHandler } from './apply-manual-keyframe-track.js';
 import { createApplyStyleToNodeHandler } from './apply-style-to-node.js';
@@ -19,6 +24,7 @@ import { createCloneNodeHandler } from './clone-node.js';
 import { createCombineAsVariantsHandler } from './combine-as-variants.js';
 import { createSetComplexStrokeHandler } from './complex-stroke.js';
 import { createCreateComponentHandler } from './create-component.js';
+import { createCreateConnectorHandler } from './create-connector.js';
 import { createCreateEffectStyleHandler } from './create-effect-style.js';
 import { createCreateEllipseHandler } from './create-ellipse.js';
 import { createCreateFrameHandler } from './create-frame.js';
@@ -72,6 +78,11 @@ import { createImportSvgHandler } from './import-svg.js';
 import { createImportVariableHandler } from './import-variable.js';
 import { createListFilesHandler } from './list-files.js';
 import { createSetLockedHandler } from './lock-nodes.js';
+import {
+  createAddMeasurementHandler,
+  createDeleteMeasurementHandler,
+  createUpdateMeasurementHandler,
+} from './measurements.js';
 import { createMoveNodesHandler } from './move-nodes.js';
 import { createNavigateToPageHandler } from './navigate-to-page.js';
 import { createPingHandler } from './ping.js';
@@ -90,9 +101,11 @@ import { createSaveImageFillsHandler } from './save-image-fills.js';
 import { createScanNodesByTypesHandler } from './scan-nodes-by-types.js';
 import { createScanTextNodesHandler } from './scan-text-nodes.js';
 import { createSearchNodesHandler } from './search-nodes.js';
+import { createSetAnnotationsHandler } from './set-annotations.js';
 import { createSetArcHandler } from './set-arc.js';
 import { createSetAutoLayoutHandler } from './set-auto-layout.js';
 import { createSetBlendModeHandler } from './set-blend-mode.js';
+import { createSetComponentDocumentationHandler } from './set-component-documentation.js';
 import { createSetConstraintsHandler } from './set-constraints.js';
 import { createSetCornerRadiusHandler } from './set-corner-radius.js';
 import { createSetEffectsHandler } from './set-effects.js';
@@ -111,6 +124,7 @@ import { createSetTextPropertiesHandler } from './set-text-properties.js';
 import { createSetTextRangeHandler } from './set-text-range.js';
 import { createSetTextHandler } from './set-text.js';
 import { createSetTimelineDurationHandler } from './set-timeline-duration.js';
+import { createSetTransform3dHandler } from './set-transform-3d.js';
 import { createSetVariableCodeSyntaxHandler } from './set-variable-code-syntax.js';
 import { createSetVariableValueHandler } from './set-variable-value.js';
 import { createSetVisibleHandler } from './set-visible.js';
@@ -119,9 +133,11 @@ import { createCreateTextPathHandler, createSetTextPathHandler } from './text-pa
 import { createUngroupNodesHandler } from './ungroup-nodes.js';
 import { createUpdateEffectStyleHandler } from './update-effect-style.js';
 import { createUpdateFlowsHandler } from './update-flows.js';
+import { createUpdateGridStyleHandler } from './update-grid-style.js';
 import { createUpdatePaintStyleHandler } from './update-paint-style.js';
 import { createUpdateTextStyleHandler } from './update-text-style.js';
 import { createUpdateVariableCollectionHandler } from './update-variable-collection.js';
+import { createUpdateVariableHandler } from './update-variable.js';
 import {
   createCreateVectorHandler,
   createGetVectorHandler,
@@ -138,6 +154,20 @@ import {
  * Wiring lives here (not in code.ts) so a registry test can enumerate the keys and assert they
  * match the server's advertised tools — a new tool can't be half-wired without a test failing.
  */
+/**
+ * The writes Dev Mode allows: annotations, their categories and measurements, measured; it refuses
+ * the rest.
+ */
+const DEV_MODE_WRITES = [
+  'set_annotations',
+  'create_annotation_category',
+  'update_annotation_category',
+  'delete_annotation_category',
+  'add_measurement',
+  'update_measurement',
+  'delete_measurement',
+] as const;
+
 export const createSandboxHandlers = (figmaApi: typeof figma): SandboxHandlers => {
   const figmaCtx = withInstanceIdLookup(figmaApi);
   const cache = createIdempotencyCache();
@@ -175,6 +205,7 @@ export const createSandboxHandlers = (figmaApi: typeof figma): SandboxHandlers =
     create_text_path: createCreateTextPathHandler(figmaCtx),
     set_text_path: createSetTextPathHandler(figmaCtx),
     set_complex_stroke: createSetComplexStrokeHandler(figmaCtx),
+    set_transform_3d: createSetTransform3dHandler(figmaCtx),
     create_vector: createCreateVectorHandler(figmaCtx),
     set_vector: createSetVectorHandler(figmaCtx),
     outline_stroke: createOutlineStrokeHandler(figmaCtx),
@@ -193,6 +224,7 @@ export const createSandboxHandlers = (figmaApi: typeof figma): SandboxHandlers =
     update_paint_style: createUpdatePaintStyleHandler(figmaCtx),
     update_text_style: createUpdateTextStyleHandler(figmaCtx),
     update_effect_style: createUpdateEffectStyleHandler(figmaCtx),
+    update_grid_style: createUpdateGridStyleHandler(figmaCtx),
     apply_style_to_node: createApplyStyleToNodeHandler(figmaCtx),
     import_style: createImportStyleHandler(figmaCtx),
     delete_style: createDeleteStyleHandler(figmaCtx),
@@ -207,6 +239,14 @@ export const createSandboxHandlers = (figmaApi: typeof figma): SandboxHandlers =
     import_variable: createImportVariableHandler(figmaCtx),
     set_node_variable_mode: createSetNodeVariableModeHandler(figmaCtx),
     rename_variable: createRenameVariableHandler(figmaCtx),
+    update_variable: createUpdateVariableHandler(figmaCtx),
+    set_annotations: createSetAnnotationsHandler(figmaCtx),
+    create_annotation_category: createCreateAnnotationCategoryHandler(figmaCtx),
+    update_annotation_category: createUpdateAnnotationCategoryHandler(figmaCtx),
+    delete_annotation_category: createDeleteAnnotationCategoryHandler(figmaCtx),
+    add_measurement: createAddMeasurementHandler(figmaCtx),
+    update_measurement: createUpdateMeasurementHandler(figmaCtx),
+    delete_measurement: createDeleteMeasurementHandler(figmaCtx),
     set_variable_code_syntax: createSetVariableCodeSyntaxHandler(figmaCtx),
     delete_variable: createDeleteVariableHandler(figmaCtx),
     delete_variable_mode: createDeleteVariableModeHandler(figmaCtx),
@@ -240,8 +280,10 @@ export const createSandboxHandlers = (figmaApi: typeof figma): SandboxHandlers =
     create_ellipse: createCreateEllipseHandler(figmaCtx),
     create_component: createCreateComponentHandler(figmaCtx),
     create_section: createCreateSectionHandler(figmaCtx),
+    create_connector: createCreateConnectorHandler(figmaCtx),
     create_instance: createCreateInstanceHandler(figmaCtx),
     combine_as_variants: createCombineAsVariantsHandler(figmaCtx),
+    set_component_documentation: createSetComponentDocumentationHandler(figmaCtx),
     // Motion (beta) — Figma Design only
     apply_animation_style: createApplyAnimationStyleHandler(figmaCtx),
     remove_animation_style: createRemoveAnimationStyleHandler(figmaCtx),
@@ -287,6 +329,8 @@ export const createSandboxHandlers = (figmaApi: typeof figma): SandboxHandlers =
   for (const name of Object.keys(rawWrites)) {
     handlers[name] = markWriteHandler(idempotent(cache, undoStep(rawWrites[name]!)));
   }
+  // The writes Dev Mode allows (measured 2026-11-20; it refuses every other one).
+  for (const name of DEV_MODE_WRITES) markDevModeWrite(handlers[name]!);
   handlers.batch = markWriteHandler(
     idempotent(cache, undoStep(createBatchHandler(figmaCtx, rawWrites))),
   );

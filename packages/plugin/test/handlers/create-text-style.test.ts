@@ -41,6 +41,18 @@ const fakeFigma = (
   return { figma: figmaCtx, loaded, style, createTextStyle, bound, removed: () => removed };
 };
 
+/** A style whose link setter stores something other than what it was sent, as Figma might. */
+const normalizingLinks = (target: Record<string, unknown>): void => {
+  let stored: { uri: string }[] = [];
+  Object.defineProperty(target, 'documentationLinks', {
+    enumerable: true,
+    get: () => stored,
+    set: (v: { uri: string }[]) => {
+      stored = v.map(l => ({ uri: l.uri.toLowerCase() }));
+    },
+  });
+};
+
 describe('create_text_style handler', () => {
   it('creates a text style, loading the font before assigning it', async () => {
     const { figma: f, loaded, style } = fakeFigma();
@@ -171,6 +183,26 @@ describe('create_text_style handler', () => {
     expect(removed()).toBe(1);
   });
 
+  // The removal used to be a bare remove(): had it thrown, its error replaced the call's own, and
+  // the agent learned neither why the create failed nor that a style was left behind.
+  it("keeps the call's own error, and says so, when the style it created cannot be removed", async () => {
+    const variable = { id: 'V:1', name: 'size/lg', resolvedType: 'FLOAT', valuesByMode: {} };
+    const { figma: f, style } = fakeFigma({}, { 'V:1': variable });
+    style.fontName = { family: 'Inter', style: 'Regular' };
+    style.setBoundVariable = () => {
+      throw new Error('in setBoundVariable: unloaded font "Roboto Bold"');
+    };
+    style.remove = () => {
+      throw new Error('in remove: refused');
+    };
+    await expect(
+      createCreateTextStyleHandler(f)({ name: 'Heading/H1', boundVariables: { fontSize: 'V:1' } }),
+    ).rejects.toThrow(
+      'in setBoundVariable: unloaded font "Roboto Bold" — and the new style S:0 could not be ' +
+        'removed: in remove: refused',
+    );
+  });
+
   it('loads the face a fontFamily binding will resolve to before binding it', async () => {
     const variable = {
       id: 'V:f',
@@ -276,5 +308,38 @@ describe('create_text_style handler', () => {
     // swap to land before the style swap runs.
     expect(loaded).toContainEqual({ family: 'Roboto', style: 'Regular' });
     expect(loaded).toContainEqual({ family: 'Roboto', style: 'Bold' });
+  });
+
+  it('creates the style with its documentation link, and removes it when Figma refuses the link', async () => {
+    const { figma: f, style, removed } = fakeFigma();
+    style.fontName = { family: 'Inter', style: 'Regular' };
+    style.documentationLinks = [];
+    await createCreateTextStyleHandler(f)({
+      name: 'Body',
+      documentationLinks: [{ uri: 'https://a.com' }],
+    });
+    expect(style.documentationLinks).toEqual([{ uri: 'https://a.com' }]);
+
+    Object.defineProperty(style, 'documentationLinks', {
+      get: () => [],
+      set: () => {
+        throw new Error('in set_documentationLinks: Documentation link must be a URL');
+      },
+    });
+    await expect(
+      createCreateTextStyleHandler(f)({ name: 'Body', documentationLinks: [{ uri: 'www.a.com' }] }),
+    ).rejects.toThrow('Documentation link must be a URL');
+    expect(removed()).toBe(1);
+  });
+
+  it('says in adjusted when the link was stored differently from what was sent', async () => {
+    const { figma: f, style } = fakeFigma();
+    style.fontName = { family: 'Inter', style: 'Regular' };
+    normalizingLinks(style);
+    const result = (await createCreateTextStyleHandler(f)({
+      name: 'Body',
+      documentationLinks: [{ uri: 'HTTPS://A.COM' }],
+    })) as { adjusted?: string };
+    expect(result.adjusted).toBe('documentationLinks were stored as ["https://a.com"]');
   });
 });

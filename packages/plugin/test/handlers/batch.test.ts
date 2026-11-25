@@ -4,9 +4,14 @@ import type { BatchResult } from '@figwright/shared';
 import { describe, expect, it, vi } from 'vitest';
 
 import type { SandboxHandlers } from '../../src/dispatcher.js';
+import { snapshotDocumentation } from '../../src/documentation.js';
 import { readTracks, resetGridTrackReadsForTests } from '../../src/grid-tracks.js';
 import { createAddComponentPropertyHandler } from '../../src/handlers/add-component-property.js';
 import { createAddVariableModeHandler } from '../../src/handlers/add-variable-mode.js';
+import {
+  createCreateAnnotationCategoryHandler,
+  createUpdateAnnotationCategoryHandler,
+} from '../../src/handlers/annotation-categories.js';
 import { createApplyAnimationStyleHandler } from '../../src/handlers/apply-animation-style.js';
 import { createApplyManualKeyframeTrackHandler } from '../../src/handlers/apply-manual-keyframe-track.js';
 import { createBatchRenameNodesHandler } from '../../src/handlers/batch-rename-nodes.js';
@@ -22,6 +27,10 @@ import { createDeleteNodesHandler } from '../../src/handlers/delete-nodes.js';
 import { createEditComponentPropertyHandler } from '../../src/handlers/edit-component-property.js';
 import { createFlipNodesHandler } from '../../src/handlers/flip-nodes.js';
 import { createGroupNodesHandler } from '../../src/handlers/group-nodes.js';
+import {
+  createAddMeasurementHandler,
+  createUpdateMeasurementHandler,
+} from '../../src/handlers/measurements.js';
 import { createMoveNodesHandler } from '../../src/handlers/move-nodes.js';
 import { createNavigateToPageHandler } from '../../src/handlers/navigate-to-page.js';
 import { createRemoveReactionsHandler } from '../../src/handlers/remove-reactions.js';
@@ -30,7 +39,9 @@ import { createRenameVariableHandler } from '../../src/handlers/rename-variable.
 import { createReorderNodesHandler } from '../../src/handlers/reorder-nodes.js';
 import { createReparentNodesHandler } from '../../src/handlers/reparent-nodes.js';
 import { createRepeatNodesHandler, createSetRepeatHandler } from '../../src/handlers/repeat.js';
+import { createSetAnnotationsHandler } from '../../src/handlers/set-annotations.js';
 import { createSetAutoLayoutHandler } from '../../src/handlers/set-auto-layout.js';
+import { createSetComponentDocumentationHandler } from '../../src/handlers/set-component-documentation.js';
 import { createSetCornerRadiusHandler } from '../../src/handlers/set-corner-radius.js';
 import { createSetFillsHandler } from '../../src/handlers/set-fills.js';
 import { createSetInstancePropertiesHandler } from '../../src/handlers/set-instance-properties.js';
@@ -39,23 +50,30 @@ import { createSetPositionHandler } from '../../src/handlers/set-position.js';
 import { createSetReactionsHandler } from '../../src/handlers/set-reactions.js';
 import { createSetStrokesHandler } from '../../src/handlers/set-strokes.js';
 import { createSetTextPropertiesHandler } from '../../src/handlers/set-text-properties.js';
+import { createSetTextRangeHandler } from '../../src/handlers/set-text-range.js';
 import { createSetTextHandler } from '../../src/handlers/set-text.js';
 import { createSetTimelineDurationHandler } from '../../src/handlers/set-timeline-duration.js';
+import { createSetTransform3dHandler } from '../../src/handlers/set-transform-3d.js';
 import { createSetVariableCodeSyntaxHandler } from '../../src/handlers/set-variable-code-syntax.js';
 import { createSetVariableValueHandler } from '../../src/handlers/set-variable-value.js';
 import { createSetVisibleHandler } from '../../src/handlers/set-visible.js';
 import { createSwapComponentHandler } from '../../src/handlers/swap-component.js';
 import { createSetTextPathHandler } from '../../src/handlers/text-path.js';
 import { createUpdateFlowsHandler } from '../../src/handlers/update-flows.js';
+import { createUpdateGridStyleHandler } from '../../src/handlers/update-grid-style.js';
 import { createUpdatePaintStyleHandler } from '../../src/handlers/update-paint-style.js';
 import { createUpdateTextStyleHandler } from '../../src/handlers/update-text-style.js';
 import { createUpdateVariableCollectionHandler } from '../../src/handlers/update-variable-collection.js';
+import { createUpdateVariableHandler } from '../../src/handlers/update-variable.js';
 import {
   createCreateVectorHandler,
   createOutlineStrokeHandler,
   createSetVectorHandler,
 } from '../../src/handlers/vector.js';
 import { createIdempotencyCache, idempotent } from '../../src/idempotency.js';
+import { annotatedNode } from '../annotations-fake.js';
+import { fakeDocumented } from '../documentation-fake.js';
+import { measuredPages } from '../measurements-fake.js';
 import { makeFlowsFigma } from './flows-fake.js';
 
 /** A mutable node store backing a fake figma whose getNodeByIdAsync / createFrame share one map. */
@@ -799,6 +817,73 @@ describe('batch handler', () => {
       /rolled back 1 applied op\(s\) \(restored with residue: op 0 \(set_text_properties\): text I9:9;1:1 is back at 100 × 40, not the 100 × 20 it had/,
     );
     expect(mode).toBe('NONE');
+  });
+
+  /**
+   * A FigJam sticky whose words live in a sublayer shaped as measured: every run field and range
+   * setter of a TEXT node, but no type, no box (width / height / auto-resize, alignment) and no
+   * node-level bindings.
+   */
+  const sticky = (id: string, characters: string) => {
+    const hidden = new Set<PropertyKey>([
+      'type',
+      'parent',
+      'width',
+      'height',
+      'textAutoResize',
+      'textTruncation',
+      'maxLines',
+      'textAlignHorizontal',
+      'textAlignVertical',
+      'boundVariables',
+      'setBoundVariable',
+    ]);
+    const text = fakeText(`${id}-text`, characters);
+    const host = new Proxy(text, {
+      has: (target, key) => !hidden.has(key) && key in target,
+      get: (target, key) => (hidden.has(key) ? undefined : Reflect.get(target, key)),
+    });
+    return { node: { id, type: 'STICKY', parent: null, text: host }, host };
+  };
+
+  it('brings back the words and runs a rolled-back set_text wrote on a FigJam sticky', async () => {
+    const { node, host } = sticky('8:1', 'Hello World');
+    (host.setRangeFontName as (s: number, e: number, v: unknown) => void)(6, 11, INTER_BOLD);
+    const before = segmentsOf(host);
+    const { figmaCtx, store } = makeFigma({ F: { id: 'F', fills: [] } });
+    store.set('8:1', node);
+    const handler = createBatchHandler(figmaCtx, {
+      set_text: createSetTextHandler(figmaCtx),
+      set_fills: createSetFillsHandler(figmaCtx),
+    });
+
+    await expect(
+      handler({ ops: [{ tool: 'set_text', params: { nodeId: '8:1', characters: 'Bye' } }, FAIL] }),
+    ).rejects.toThrow(/rolled back 1 applied op\(s\): GRADIENT_LINEAR/);
+
+    expect(host.characters).toBe('Hello World');
+    expect(segmentsOf(host)).toEqual(before);
+  });
+
+  it('refuses a range tool on a FigJam sticky in a batch, and says set_text reaches it', async () => {
+    const { node } = sticky('8:2', 'Hello');
+    const { figmaCtx, store } = makeFigma({ F: { id: 'F', fills: [] } });
+    store.set('8:2', node);
+    const handler = createBatchHandler(figmaCtx, {
+      set_text_range: createSetTextRangeHandler(figmaCtx),
+    });
+    await expect(
+      handler({
+        ops: [
+          {
+            tool: 'set_text_range',
+            params: { nodeId: '8:2', ranges: [{ start: 0, end: 1, fontSize: 30 }] },
+          },
+        ],
+      }),
+    ).rejects.toThrow(
+      /batch\/set_text_range: node 8:2 is not a TEXT node or text on a path — a FigJam STICKY's words are rewritten with set_text/,
+    );
   });
 
   it('brings back the runs a set_text restyled', async () => {
@@ -2927,6 +3012,116 @@ describe('batch inverses for Figma Draw', () => {
     });
   });
 
+  /**
+   * An instance whose layer `I9:9;1:1` is `layer`, its main component's layer `1:1` the same. A
+   * stroke or a text path's start written on such a layer is never listed in the instance's
+   * overrides (measured), so writing the old value back leaves no mark — and leaves it the
+   * instance's own, no longer following the main. The rollback resets the instance to undo that.
+   */
+  const insideInstance = (layer: Record<string, unknown>) => {
+    const instance: Record<string, unknown> = {
+      type: 'INSTANCE',
+      id: '9:9',
+      name: 'Card',
+      parent: null,
+      removed: false,
+      overrides: [],
+      componentProperties: {},
+      findAllWithCriteria: () => [],
+      removeOverrides: vi.fn<() => void>(),
+    };
+    const node = { ...layer, id: 'I9:9;1:1', parent: instance };
+    instance.findAll = () => [node];
+    const { figmaCtx, store } = makeFigma({ F: { id: 'F', fills: [] } });
+    store.set('9:9', instance);
+    store.set('I9:9;1:1', node);
+    store.set('1:1', { ...layer, id: '1:1' });
+    (figmaCtx as unknown as { loadBrushesAsync: unknown }).loadBrushesAsync = async () => {};
+    return { figmaCtx, store, instance };
+  };
+
+  it('resets the instance a rolled-back set_complex_stroke wrote into, though it left no override mark', async () => {
+    const { figmaCtx, store, instance } = insideInstance({
+      type: 'VECTOR',
+      strokes: [{ type: 'SOLID', visible: true, color: { r: 0, g: 0, b: 0 } }],
+      complexStrokeProperties: { type: 'BASIC' },
+      variableWidthStrokeProperties: { widthProfile: 'UNIFORM' },
+    });
+    const handler = createBatchHandler(figmaCtx, {
+      set_complex_stroke: createSetComplexStrokeHandler(figmaCtx),
+      set_fills: createSetFillsHandler(figmaCtx),
+    });
+    await expect(
+      handler({
+        ops: [
+          {
+            tool: 'set_complex_stroke',
+            params: { nodeId: 'I9:9;1:1', complexStrokeProperties: { type: 'DYNAMIC' } },
+          },
+          FAIL,
+        ],
+      }),
+    ).rejects.toThrow(/rolled back 1 applied op\(s\): GRADIENT_LINEAR/);
+    expect(instance.removeOverrides).toHaveBeenCalledOnce();
+    expect(store.get('I9:9;1:1')!.complexStrokeProperties).toEqual({ type: 'BASIC' });
+  });
+
+  it('resets the instance a rolled-back set_text_path wrote into, though it left no override mark', async () => {
+    const { figmaCtx, instance } = insideInstance({
+      type: 'TEXT_PATH',
+      textPathStartData: { segment: 1, position: 0.25 },
+      vectorNetwork: { segments: [{}, {}, {}, {}] },
+    });
+    const handler = createBatchHandler(figmaCtx, {
+      set_text_path: createSetTextPathHandler(figmaCtx),
+      set_fills: createSetFillsHandler(figmaCtx),
+    });
+    await expect(
+      handler({
+        ops: [{ tool: 'set_text_path', params: { nodeId: 'I9:9;1:1', startSegment: 3 } }, FAIL],
+      }),
+    ).rejects.toThrow(/rolled back 1 applied op\(s\): GRADIENT_LINEAR/);
+    expect(instance.removeOverrides).toHaveBeenCalledOnce();
+  });
+
+  it('resets the instance a rolled-back set_transform_3d wrote into, though it left no override mark', async () => {
+    const { figmaCtx, instance } = insideInstance({
+      type: 'RECTANGLE',
+      transform3d: { type: 'NONE' },
+      transformOrigin: { x: { unit: 'PERCENT', value: 50 }, y: { unit: 'PERCENT', value: 50 } },
+    });
+    const handler = createBatchHandler(figmaCtx, {
+      set_transform_3d: createSetTransform3dHandler(figmaCtx),
+      set_fills: createSetFillsHandler(figmaCtx),
+    });
+    await expect(
+      handler({
+        ops: [
+          {
+            tool: 'set_transform_3d',
+            params: { nodeId: 'I9:9;1:1', transform3d: { rotateY: 30 } },
+          },
+          FAIL,
+        ],
+      }),
+    ).rejects.toThrow(/rolled back 1 applied op\(s\): GRADIENT_LINEAR/);
+    expect(instance.removeOverrides).toHaveBeenCalledOnce();
+  });
+
+  it('leaves the instance unreset after an ordinary op that left no override mark', async () => {
+    const { figmaCtx, instance } = insideInstance({ type: 'RECTANGLE', opacity: 1 });
+    const handler = createBatchHandler(figmaCtx, {
+      set_opacity: createSetOpacityHandler(figmaCtx),
+      set_fills: createSetFillsHandler(figmaCtx),
+    });
+    await expect(
+      handler({
+        ops: [{ tool: 'set_opacity', params: { nodeId: 'I9:9;1:1', opacity: 0.5 } }, FAIL],
+      }),
+    ).rejects.toThrow(/rolled back 1/);
+    expect(instance.removeOverrides).not.toHaveBeenCalled();
+  });
+
   it('puts a pattern fill back through the async setter, the only one Figma lets take it', async () => {
     const pattern = {
       type: 'PATTERN',
@@ -3344,5 +3539,552 @@ describe('batch references to earlier ops ("$N")', () => {
       ],
     });
     expect(store.get('N:1')!.name).toBe('$5');
+  });
+});
+
+describe('set_component_documentation in a batch', () => {
+  const setUp = (init: Parameters<typeof fakeDocumented>[0]) => {
+    const { figmaCtx, store } = makeWide();
+    failingFrame(store);
+    const node = fakeDocumented({ id: 'C:1', ...init });
+    store.set('C:1', node as unknown as Record<string, unknown>);
+    const handler = createBatchHandler(figmaCtx, {
+      set_component_documentation: createSetComponentDocumentationHandler(figmaCtx),
+      set_fills: createSetFillsHandler(figmaCtx),
+    });
+    return { node, handler };
+  };
+
+  // Writing the old plain text back would lose the formatting; writing the old markdown back would
+  // turn the literal "[x](y)" into a link. Each case needs a different one of the two.
+  it.each([
+    ['formatted', { descriptionMarkdown: '**Use** for [primary](https://a.com)\n\n- one\n- two' }],
+    ['plain text that reads as markdown', { description: '[x](y)\n\n1. not a list' }],
+    ['plain with underscores', { description: 'kbq-arrow_16\n\npt-icons_16' }],
+  ])('rolls a %s description and its link back exactly', async (_, init) => {
+    const { node, handler } = setUp({ ...init, documentationLinks: [{ uri: 'https://old.com' }] });
+    const before = snapshotDocumentation(node);
+    await expect(
+      handler({
+        ops: [
+          {
+            tool: 'set_component_documentation',
+            params: {
+              nodeId: 'C:1',
+              description: 'replaced',
+              documentationLinks: [{ uri: 'https://new.com' }],
+              replaceFormatting: true,
+            },
+          },
+          FAIL,
+        ],
+      }),
+    ).rejects.toThrow(/rolled back 1 applied op\(s\)/);
+    expect(snapshotDocumentation(node)).toEqual(before);
+  });
+
+  // The issue's flow over descriptions typed in Figma: read the plain text, edit it, write it back.
+  // Sent as read, every paragraph would gain a blank line; the whole batch is refused instead.
+  it('refuses a batch that would add blank lines to typed paragraphs, and leaves every one as it was', async () => {
+    const { figmaCtx, store } = makeWide();
+    const typed = (id: string) => {
+      const node = fakeDocumented({ id, descriptionMarkdown: `${id}\\_16\n\ntags\n\npt\\_16` });
+      store.set(id, node as unknown as Record<string, unknown>);
+      return node;
+    };
+    const nodes = [typed('C:1'), typed('C:2')];
+    const before = nodes.map(snapshotDocumentation);
+    const handler = createBatchHandler(figmaCtx, {
+      set_component_documentation: createSetComponentDocumentationHandler(figmaCtx),
+    });
+    await expect(
+      handler({
+        ops: nodes.map(node => ({
+          tool: 'set_component_documentation',
+          params: {
+            nodeId: node.id,
+            description: node.description.replace('tags', 'sorted, tags'),
+          },
+        })),
+      }),
+    ).rejects.toThrow(
+      /op 0 \(set_component_documentation\) failed, rolled back 0 applied op\(s\): .*paragraph breaks/,
+    );
+    expect(nodes.map(snapshotDocumentation)).toEqual(before);
+  });
+
+  it('refuses a node it cannot document before anything runs', async () => {
+    const { handler } = setUp({});
+    await expect(
+      handler({
+        ops: [
+          { tool: 'set_component_documentation', params: { nodeId: 'X:404', description: 'x' } },
+        ],
+      }),
+    ).rejects.toThrow(/node X:404 not found/);
+  });
+});
+
+describe('style documentation links in a batch', () => {
+  // The batch inverse records every field a style update can write, the link included, so a
+  // rollback puts the link, the grids (colour and binding on them) and the labels back as they were.
+  it('rolls update_grid_style and update_paint_style back, links and grids included', async () => {
+    const { figmaCtx, store, styles } = makeWide();
+    failingFrame(store);
+    const grids = [
+      { pattern: 'GRID', visible: true, sectionSize: 4, color: { r: 0, g: 1, b: 0, a: 0.5 } },
+    ];
+    const grid: Record<string, unknown> = {
+      id: 'S:g',
+      type: 'GRID',
+      name: 'Layout',
+      description: 'grid',
+      documentationLinks: [{ uri: 'https://old.com/grid' }],
+      layoutGrids: grids,
+    };
+    const paint: Record<string, unknown> = {
+      id: 'S:p',
+      type: 'PAINT',
+      name: 'Brand',
+      description: 'paint',
+      documentationLinks: [],
+      paints: [],
+    };
+    styles.set('S:g', grid);
+    styles.set('S:p', paint);
+    const handler = createBatchHandler(figmaCtx, {
+      update_grid_style: createUpdateGridStyleHandler(figmaCtx),
+      update_paint_style: createUpdatePaintStyleHandler(figmaCtx),
+      set_fills: createSetFillsHandler(figmaCtx),
+    });
+    await expect(
+      handler({
+        ops: [
+          {
+            tool: 'update_grid_style',
+            params: {
+              styleId: 'S:g',
+              name: 'Layout/2',
+              description: 'changed',
+              documentationLinks: [],
+              grids: [{ pattern: 'GRID', visible: true, sectionSize: 16 }],
+            },
+          },
+          {
+            tool: 'update_paint_style',
+            params: { styleId: 'S:p', documentationLinks: [{ uri: 'https://new.com' }] },
+          },
+          FAIL,
+        ],
+      }),
+    ).rejects.toThrow(/rolled back 2 applied op\(s\)/);
+    expect(grid).toEqual({
+      id: 'S:g',
+      type: 'GRID',
+      name: 'Layout',
+      description: 'grid',
+      documentationLinks: [{ uri: 'https://old.com/grid' }],
+      layoutGrids: grids,
+    });
+    expect(paint.documentationLinks).toEqual([]);
+  });
+
+  it('rolls an update_text_style link back', async () => {
+    const { figmaCtx, store, styles } = makeWide();
+    failingFrame(store);
+    const text: Record<string, unknown> = {
+      id: 'S:t',
+      type: 'TEXT',
+      name: 'Body',
+      description: '',
+      documentationLinks: [{ uri: 'https://old.com/text' }],
+      fontName: { family: 'Inter', style: 'Regular' },
+      boundVariables: {},
+      getStyleConsumersAsync: async () => [],
+    };
+    styles.set('S:t', text);
+    // The text-style inverse loads the face before writing typography back.
+    Object.assign(figmaCtx, { loadFontAsync: async () => undefined });
+    const handler = createBatchHandler(figmaCtx, {
+      update_text_style: createUpdateTextStyleHandler(figmaCtx),
+      set_fills: createSetFillsHandler(figmaCtx),
+    });
+    await expect(
+      handler({
+        ops: [
+          { tool: 'update_text_style', params: { styleId: 'S:t', documentationLinks: [] } },
+          FAIL,
+        ],
+      }),
+    ).rejects.toThrow(/rolled back 1 applied op\(s\)/);
+    expect(text.documentationLinks).toEqual([{ uri: 'https://old.com/text' }]);
+  });
+
+  // A face that cannot be loaded — a font that is not installed on this machine — must not stop a
+  // batch from undoing a rename, a new description or a link: none of them is typography, so the
+  // way back writes no typography and loads no face. On main the inverse recorded every field and
+  // loaded the face to write them back, so the undo failed and the batch stayed half applied.
+  it('undoes an update_text_style that wrote only labels without loading the font', async () => {
+    const { figmaCtx, store, styles } = makeWide();
+    failingFrame(store);
+    const text: Record<string, unknown> = {
+      id: 'S:t',
+      type: 'TEXT',
+      name: 'Body',
+      description: 'orig',
+      documentationLinks: [{ uri: 'https://old.com' }],
+      fontName: { family: 'Not Installed', style: 'Regular' },
+      fontSize: 18,
+      boundVariables: {},
+      getStyleConsumersAsync: async () => [],
+    };
+    styles.set('S:t', text);
+    const loaded: unknown[] = [];
+    Object.assign(figmaCtx, {
+      loadFontAsync: async (f: unknown) => {
+        loaded.push(f);
+        throw new Error('font not available');
+      },
+    });
+    const handler = createBatchHandler(figmaCtx, {
+      update_text_style: createUpdateTextStyleHandler(figmaCtx),
+      set_fills: createSetFillsHandler(figmaCtx),
+    });
+    await expect(
+      handler({
+        ops: [
+          {
+            tool: 'update_text_style',
+            params: { styleId: 'S:t', name: 'Heading', description: 'new', documentationLinks: [] },
+          },
+          FAIL,
+        ],
+      }),
+    ).rejects.toThrow(/^batch: op 1 \(set_fills\) failed, rolled back 1 applied op\(s\): /);
+    expect([text.name, text.description, text.documentationLinks]).toEqual([
+      'Body',
+      'orig',
+      [{ uri: 'https://old.com' }],
+    ]);
+    expect(loaded).toEqual([]);
+  });
+
+  // A literal is typography: its way back still loads the face, as the handler's own rollback does.
+  it('still loads the font to undo a literal', async () => {
+    const { figmaCtx, store, styles } = makeWide();
+    failingFrame(store);
+    const text: Record<string, unknown> = {
+      id: 'S:t',
+      type: 'TEXT',
+      name: 'Body',
+      fontName: { family: 'Inter', style: 'Regular' },
+      fontSize: 18,
+      boundVariables: {},
+      setBoundVariable: () => undefined,
+      getStyleConsumersAsync: async () => [],
+    };
+    styles.set('S:t', text);
+    const loaded: unknown[] = [];
+    Object.assign(figmaCtx, {
+      loadFontAsync: async (f: unknown) => {
+        loaded.push(f);
+      },
+    });
+    const handler = createBatchHandler(figmaCtx, {
+      update_text_style: createUpdateTextStyleHandler(figmaCtx),
+      set_fills: createSetFillsHandler(figmaCtx),
+    });
+    await expect(
+      handler({
+        ops: [{ tool: 'update_text_style', params: { styleId: 'S:t', fontSize: 30 } }, FAIL],
+      }),
+    ).rejects.toThrow(/rolled back 1 applied op\(s\)/);
+    expect(text.fontSize).toBe(18);
+    expect(loaded.length).toBeGreaterThan(0);
+  });
+
+  it('rolls back update_variable and a collection publishing flag', async () => {
+    const { figmaCtx, store, variables, collections } = makeWide();
+    failingFrame(store);
+    const collection: Record<string, unknown> = {
+      id: 'C:1',
+      name: 'Colour',
+      modes: [{ modeId: 'm1', name: 'Light' }],
+      hiddenFromPublishing: true,
+      renameMode: () => undefined,
+    };
+    collections.set('C:1', collection);
+    const variable: Record<string, unknown> = {
+      id: 'V:1',
+      name: 'color/brand',
+      description: 'orig',
+      scopes: ['ALL_SCOPES'],
+      hiddenFromPublishing: false,
+      resolvedType: 'COLOR',
+      remote: false,
+    };
+    variables.set('V:1', variable);
+    const handler = createBatchHandler(figmaCtx, {
+      update_variable: createUpdateVariableHandler(figmaCtx),
+      update_variable_collection: createUpdateVariableCollectionHandler(figmaCtx),
+      set_fills: createSetFillsHandler(figmaCtx),
+    });
+    await expect(
+      handler({
+        ops: [
+          {
+            tool: 'update_variable',
+            params: {
+              variableId: 'V:1',
+              name: 'color/primary',
+              description: 'new',
+              scopes: ['FRAME_FILL'],
+              hiddenFromPublishing: true,
+            },
+          },
+          {
+            tool: 'update_variable_collection',
+            params: { collectionId: 'C:1', hiddenFromPublishing: false },
+          },
+          FAIL,
+        ],
+      }),
+    ).rejects.toThrow(/rolled back 2 applied op\(s\)/);
+    expect(variable).toMatchObject({
+      name: 'color/brand',
+      description: 'orig',
+      scopes: ['ALL_SCOPES'],
+      hiddenFromPublishing: false,
+    });
+    expect(collection.hiddenFromPublishing).toBe(true);
+  });
+
+  // A rollback writes the old name back, and a name write resets hiddenFromPublishing to true in
+  // Figma (measured): the rename and its undo both keep a published collection published.
+  it('rolls a collection rename back without taking it out of the published library', async () => {
+    const { figmaCtx, store, collections } = makeWide();
+    failingFrame(store);
+    let name = 'Colour';
+    const collection: Record<string, unknown> = {
+      id: 'C:1',
+      modes: [{ modeId: 'm1', name: 'Light' }],
+      hiddenFromPublishing: false,
+      renameMode: () => undefined,
+    };
+    Object.defineProperty(collection, 'name', {
+      get: () => name,
+      set: (v: string) => {
+        name = v;
+        collection.hiddenFromPublishing = true;
+      },
+    });
+    collections.set('C:1', collection);
+    const handler = createBatchHandler(figmaCtx, {
+      update_variable_collection: createUpdateVariableCollectionHandler(figmaCtx),
+      set_fills: createSetFillsHandler(figmaCtx),
+    });
+    await expect(
+      handler({
+        ops: [
+          { tool: 'update_variable_collection', params: { collectionId: 'C:1', name: 'Color' } },
+          FAIL,
+        ],
+      }),
+    ).rejects.toThrow(/rolled back 1 applied op\(s\)/);
+    expect([name, collection.hiddenFromPublishing]).toEqual(['Colour', false]);
+  });
+
+  it('rolls back set_annotations, a new category and a category edit', async () => {
+    const { figmaCtx, store } = makeWide();
+    failingFrame(store);
+    const node = annotatedNode();
+    node.annotations = [
+      { label: 'p1\n\n\np2' },
+      { labelMarkdown: 'p1\n\np2' },
+      { label: 'kept', categoryId: '127:0' },
+    ] as Annotation[];
+    const before = JSON.stringify(node.annotations);
+    const categories = new Map<
+      string,
+      {
+        id: string;
+        label: string;
+        color: string;
+        isPreset: boolean;
+        setLabel: (l: string) => void;
+        setColor: (c: string) => void;
+        remove: () => void;
+      }
+    >();
+    const makeCategory = (id: string, label: string, color: string, isPreset: boolean) => {
+      const c = {
+        id,
+        label,
+        color,
+        isPreset,
+        setLabel(l: string) {
+          c.label = l;
+          c.isPreset = false;
+        },
+        setColor(col: string) {
+          c.color = col;
+          c.isPreset = false;
+        },
+        remove() {
+          categories.delete(id);
+        },
+      };
+      categories.set(id, c);
+      return c;
+    };
+    const custom = makeCategory('134:1', 'Analytics', 'teal', false);
+    Object.assign(figmaCtx, {
+      getNodeByIdAsync: async (id: string) => (id === '1:1' ? node : (store.get(id) ?? null)),
+      annotations: {
+        getAnnotationCategoryByIdAsync: async (id: string) => categories.get(id) ?? null,
+        getAnnotationCategoriesAsync: async () => [...categories.values()],
+        addAnnotationCategoryAsync: async ({ label, color }: { label: string; color: string }) =>
+          makeCategory('134:9', label, color, false),
+      },
+    });
+    makeCategory('127:0', 'Development', 'green', true);
+    const handler = createBatchHandler(figmaCtx, {
+      set_annotations: createSetAnnotationsHandler(figmaCtx),
+      create_annotation_category: createCreateAnnotationCategoryHandler(figmaCtx),
+      update_annotation_category: createUpdateAnnotationCategoryHandler(figmaCtx),
+      set_fills: createSetFillsHandler(figmaCtx),
+    });
+    await expect(
+      handler({
+        ops: [
+          { tool: 'create_annotation_category', params: { label: 'New', color: 'red' } },
+          {
+            tool: 'set_annotations',
+            params: { nodeId: '1:1', annotations: [{ label: 'filed', categoryId: '$0' }] },
+          },
+          {
+            tool: 'update_annotation_category',
+            params: { categoryId: '134:1', label: 'Metrics', color: 'blue' },
+          },
+          FAIL,
+        ],
+      }),
+    ).rejects.toThrow(/rolled back 3 applied op\(s\)/);
+    expect(JSON.stringify(node.annotations)).toBe(before);
+    expect(categories.has('134:9')).toBe(false);
+    expect([custom.label, custom.color]).toEqual(['Analytics', 'teal']);
+  });
+
+  it("says a preset it renamed stays a custom category, and refuses to batch a category's deletion", async () => {
+    const { figmaCtx, store } = makeWide();
+    failingFrame(store);
+    const preset = {
+      id: '127:0',
+      label: 'Development',
+      color: 'green',
+      isPreset: true,
+      setLabel(l: string) {
+        preset.label = l;
+        preset.isPreset = false;
+      },
+      setColor(c: string) {
+        preset.color = c;
+        preset.isPreset = false;
+      },
+    };
+    Object.assign(figmaCtx, {
+      annotations: {
+        getAnnotationCategoryByIdAsync: async (id: string) => (id === '127:0' ? preset : null),
+      },
+    });
+    const handler = createBatchHandler(figmaCtx, {
+      update_annotation_category: createUpdateAnnotationCategoryHandler(figmaCtx),
+      set_fills: createSetFillsHandler(figmaCtx),
+    });
+    await expect(
+      handler({
+        ops: [
+          { tool: 'update_annotation_category', params: { categoryId: '127:0', label: 'Dev' } },
+          FAIL,
+        ],
+      }),
+    ).rejects.toThrow(
+      /annotation category 127:0 "Development" is no longer one of Figma's presets, and nothing makes it one again/,
+    );
+    expect(preset.label).toBe('Development');
+    await expect(
+      handler({ ops: [{ tool: 'delete_annotation_category', params: { categoryId: '127:0' } }] }),
+    ).rejects.toThrow(/not batchable — a deleted category cannot be brought back under its id/);
+  });
+
+  it('rolls back add_measurement and update_measurement, and refuses to batch a deletion', async () => {
+    const { figmaCtx } = makeWide();
+    const pages = measuredPages();
+    const { home, nodes } = pages;
+    Object.defineProperty(figmaCtx, 'currentPage', { get: () => home, configurable: true });
+    Object.assign(figmaCtx, {
+      root: pages.figmaCtx.root,
+      getNodeByIdAsync: pages.figmaCtx.getNodeByIdAsync,
+    });
+    home.addMeasurement(
+      { node: nodes.get('1:1')!, side: 'TOP' },
+      { node: nodes.get('1:2')!, side: 'TOP' },
+      { freeText: 'kept' },
+    );
+    const shape = () =>
+      JSON.stringify(
+        home.list.map(x => [
+          x.id,
+          x.start.node.id,
+          x.start.side,
+          x.end.node.id,
+          x.end.side,
+          x.offset,
+          x.freeText,
+        ]),
+      );
+    const before = shape();
+    const handler = createBatchHandler(figmaCtx, {
+      add_measurement: createAddMeasurementHandler(figmaCtx),
+      update_measurement: createUpdateMeasurementHandler(figmaCtx),
+    });
+    await expect(
+      handler({
+        ops: [
+          {
+            tool: 'add_measurement',
+            params: { startNodeId: '1:1', startSide: 'LEFT', endNodeId: '1:2', endSide: 'LEFT' },
+          },
+          { tool: 'update_measurement', params: { measurementId: '$0', freeText: 'via ref' } },
+          {
+            tool: 'update_measurement',
+            params: {
+              measurementId: '9:0',
+              offset: { type: 'OUTER', fixed: 8 },
+              freeText: 'changed',
+            },
+          },
+          // Refused by Figma only when it applies.
+          {
+            tool: 'add_measurement',
+            params: { startNodeId: '1:1', startSide: 'RIGHT', endNodeId: '1:2', endSide: 'TOP' },
+          },
+        ],
+      }),
+    ).rejects.toThrow(
+      /^batch: op 3 \(add_measurement\) failed, rolled back 3 applied op\(s\): .*must be on the same axis/,
+    );
+    expect(shape()).toBe(before);
+    // An id no page has: the op's own refusal, not the inverse's.
+    await expect(
+      handler({
+        ops: [{ tool: 'update_measurement', params: { measurementId: '9:99', freeText: 'x' } }],
+      }),
+    ).rejects.toThrow(
+      /^batch: op 0 \(update_measurement\) failed, rolled back 0 applied op\(s\): update_measurement: no measurement 9:99 in this file$/,
+    );
+    await expect(
+      handler({ ops: [{ tool: 'delete_measurement', params: { measurementId: '9:0' } }] }),
+    ).rejects.toThrow(/not batchable — adding a measurement back mints a new id/);
   });
 });
